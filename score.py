@@ -14,6 +14,7 @@ from recbench_common import FIELD_TYPE, LABELS, load_jsonl, match, norm_value
 # ============================================================ settings
 SPLITS = {"train": "cases_train.jsonl", "heldout": "cases_heldout.jsonl", "hard": "cases_hard.jsonl"}
 RESULTS_CSV = "results.csv"
+COMMON_CASES_ONLY = True   # score every method in a split on the cases ALL methods covered (apples to apples)
 ECE_BINS = 15
 OVERWRITE_THRESHOLD = 0.90
 COVERAGES = [0.9, 0.8, 0.7]
@@ -220,9 +221,18 @@ def main() -> None:
         if not methods:
             continue
         results = {}
+        loaded = {m: load_jsonl("preds_%s_%s.jsonl" % (m, split)) for m in methods}
+        common = None
+        if COMMON_CASES_ONLY:
+            for m in methods:
+                ids = set(p["case_id"] for p in loaded[m])
+                common = ids if common is None else (common & ids)
         for m in methods:
-            preds = load_jsonl("preds_%s_%s.jsonl" % (m, split))
+            preds = loaded[m]
             ids = set(p["case_id"] for p in preds)
+            if common is not None:
+                ids = ids & common
+                preds = [p for p in preds if p["case_id"] in ids]
             sub = [c for c in cases if c["case_id"] in ids]   # LLM runs may cover a subset
             results[m] = score(sub, preds)
             results[m]["n_cases"] = len(sub)
@@ -230,6 +240,9 @@ def main() -> None:
                 all_rows.append((split, m, k, v))
 
         print("\n=== %s split ===" % split)
+        if common is not None and len(common) < len(cases):
+            print("(scored on the %d cases every method covered; set COMMON_CASES_ONLY = False for full-split numbers)"
+                  % len(common))
         print("%-18s %6s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s"
               % ("method", "cases", "q_acc", "ci_lo", "ci_hi", "ECE", "Brier", "wrongOW", "cov@.9",
                  "sel@80", "undecC", "macroF1", "AUCerr"))
