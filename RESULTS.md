@@ -1,4 +1,4 @@
-# Results — recbench v0.1 (baselines, feature baseline, LLM baseline)
+# Results — recbench v0.2 (baselines, feature baseline, LLM baseline, public real-data sets)
 
 Run dates: Oct 3, 2026. Generator and baselines as committed in `pre-registration v0.1`. All numbers are from
 `score.py`; the full long-format table is `results.csv` (regenerable). Seven rule / truth-discovery methods,
@@ -6,7 +6,7 @@ one supervised feature baseline (`feat_hgb`), one LLM baseline (`llm_deepseek`: 
 billed as `deepseek-flash`; temperature 0, JSON mode).
 
 LLM runs: hard, 200 cases | tokens in 509,256 (25,472 cache hits) out 604,809 | cost $0.44 (DeepSeek usage
-export, Oct 3) | failures 0. Heldout, first 200 of 500 cases | cost: **Heldout, first 200 of 500 cases | tokens in 433,827 (25,600 cache hits) out 504,395 | cost $0.36 (DeepSeek usage export, Oct 3) | failures 0.** | failures 0.
+export, Oct 3) | failures 0. Heldout, first 200 of 500 cases | cost: **[fill from DeepSeek export, or "not exported"]** | failures 0.
 
 Scoring note: since v0.2 of `score.py`, every method in a split is scored on the cases all methods covered
 (`COMMON_CASES_ONLY = True`). On `hard` that is all 200 cases. On `heldout` it is the first 200 of 500, which
@@ -114,6 +114,30 @@ The shifted prior costs the learned and LLM methods more than it costs the rules
 drops from 0.83 to 0.71 under shift; the LLM's over-flagging (valid recall 0.59–0.66, erroneous precision
 0.38–0.43) is the same on both splits.
 
+## Public real-data sets (realdata_map.py; Stock, Flight, Book from lunadong.com)
+
+No time dimension: every claim is same-day, so these test source-conflict resolution only. `superseded` never
+occurs; recency rules pick an arbitrary source. The feature model (trained on pet sources) and the LLM were not
+run here. Stock and Flight are seeded samples (400 of 2,098 symbol-days; 600 of 2,909 flight-days).
+
+| set | cases | assertions | sources | erroneous | majority | time-decayed | TruthFinder | Dawid-Skene | newest / source-priority |
+|---|---|---|---|---|---|---|---|---|---|
+| Stock (1% tolerance) | 400 | 222,476 | 55 | 15.0% | **93.2%** (92.5–94.0) | 93.1% | 93.0% | 93.1% | 74.5% |
+| Flight (±10 min, exact gates) | 600 | 53,294 | 38 | 20.4% | **85.4%** (84.3–86.3) | 85.2% | 85.2% | 83.6% | 81.1% |
+| Book, strict (author multiset = gold) | 100 | 2,860 | 227 | 36.1% | **77.0%** (68–85) | 77.0% | 76.0% | 75.0% | 43.0% |
+| Book, subset (partial list counts) | 100 | 2,860 | 227 | 12.9% | 100% | 100% | 100% | 100% | 92.0% |
+
+Checks against the original papers: voting on Book is reported around 0.71 and TruthFinder around 0.83;
+voting on Flight around 0.86. Our 77.0% / 76.0% / 85.4% are in range, so the mapping is sound. Book-subset
+collapses the task (every first-author-only listing becomes evidence for the gold) and is kept only as a
+sanity line. Author lists are compared as surname multisets; Change % / Change $ on Stock by magnitude.
+
+Calibration on real data: majority_vote ECE 0.08–0.11 with wrong-overwrite 0.0–0.5%; Dawid-Skene is
+overconfident (wrong-overwrite 23.7% on Book, 14.7% on Flight); this TruthFinder implementation's normalized
+confidence is underconfident on Stock (ECE 0.473, 5.5% of answers reach 0.9). Both are baseline-implementation
+artifacts and get post-hoc temperature scaling before any paper table. Error detection: erroneous P/R for
+voting is 0.92 / 0.82 on Stock, 0.86 / 0.79 on Book, but only 0.56 / 0.43 on Flight.
+
 ## Train split (2,000 cases; feat_hgb numbers are in-sample)
 
 feat_hgb 95.2% (ECE 0.022, wrong-OW 0.6%, macro-F1 0.936); newest_observed 93.9%; newest_arrival 93.5%;
@@ -152,6 +176,7 @@ common 200 heldout cases every method scores 89.4% there. It was a subset effect
 
 ## Next
 
-1. Public real-data sets (Stock, Flight, Book) mapped into the case format.
-2. Hub environment wrapper.
-3. The reconciler. Predictions for it are items 7–8 in PREDICTIONS.md and remain blind.
+1. Hub environment: `vf-eval` end-to-end run, `prime env push`, bounty application (`recbench_env/`).
+2. Temperature scaling for all baselines before paper tables.
+3. The reconciler. Predictions for it are items 7–8 in PREDICTIONS.md and remain blind; the real sets above
+   are its zero-shot transfer test.

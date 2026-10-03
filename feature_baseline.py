@@ -12,7 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from recbench_common import FIELD_TYPE, LABELS, SOURCES, cluster, load_jsonl, match, norm_value, truth_at, write_jsonl
+from recbench_common import (FIELD_TYPE, LABELS, SOURCES, cluster, current_truth, ftype_of, is_numeric, load_jsonl,
+                             match, norm_value, write_jsonl)
 
 # ============================================================ settings
 MODEL = "hgb"                  # "hgb" = sklearn HistGradientBoosting (no extra install) | "tabpfn" = TabPFN v2 (pip install tabpfn)
@@ -24,8 +25,7 @@ CALIBRATION = "isotonic"       # "isotonic" | "sigmoid" | None  (post-hoc calibr
 SEED = 11
 
 SOURCE_PRIORITY = {"vet_pdf": 5, "email_forward": 4, "owner": 3, "extractor": 2, "note_text": 1}
-FTYPES = sorted(set(FIELD_TYPE.values()))
-NUMERIC_FIELDS = ("weight_kg", "birth_day", "rabies_day")
+FTYPES = sorted(set(FIELD_TYPE.values())) + ["num_rel", "num_abs", "cat"]   # one-hot slots incl. real-data types
 
 
 # ============================================================ feature extraction
@@ -50,13 +50,13 @@ def field_rows(case: Dict[str, Any], field: str, A: List[Dict[str, Any]]) -> Tup
     n = len(A)
     newest_obs = max(A, key=lambda x: (x["observed_day"], x["arrived_day"]))
     newest_arr = max(A, key=lambda x: (x["arrived_day"], x["observed_day"]))
-    numeric = field in NUMERIC_FIELDS
+    numeric = is_numeric(field)
     all_vals = [vals[a["id"]] for a in A] if numeric else []
     median = float(np.median(all_vals)) if numeric else 0.0
     vet = [a for a in A if a["source"] == "vet_pdf"]
     newest_vet_val = vals[max(vet, key=lambda x: x["observed_day"])["id"]] if (vet and numeric) else None
     corrected_ids = set(a["corrects"] for a in A if a.get("corrects") is not None)
-    ftype_vec = [1.0 if FIELD_TYPE[field] == t else 0.0 for t in FTYPES]
+    ftype_vec = [1.0 if ftype_of(field) == t else 0.0 for t in FTYPES]
 
     # per-cluster rows
     crow = []
@@ -135,7 +135,7 @@ def build_dataset(cases: List[Dict[str, Any]], with_labels: bool = True):
             if not A:
                 continue
             cl, crow, arow = field_rows(case, field, A)
-            truth = truth_at(case, field, case["now_day"]) if with_labels else None
+            truth = current_truth(case, field) if with_labels else None
             c_start = len(Xc)
             for ci, c in enumerate(cl):
                 Xc.append(crow[ci])

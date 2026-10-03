@@ -1,0 +1,17 @@
+[project]
+name = "recbench-env"
+version = "0.1.0"
+description = "Longitudinal record reconciliation: given conflicting, time-stamped assertions about one entity from unreliable sources, state each field's current value with a calibrated confidence and label every assertion valid / superseded / erroneous. Fully synthetic, labeled, with adversarial injections; rewards accuracy, calibration (Brier) and labeling F1."
+tags = ["record-reconciliation", "truth-discovery", "calibration", "memory", "single-turn", "synthetic", "json"]
+requires-python = ">=3.10"
+dependencies = ["verifiers>=0.3.0", "datasets>=2.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = ["recbench_env.py", "recbench_common.py", "gen.py", "README.md"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]

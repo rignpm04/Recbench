@@ -20,6 +20,20 @@ directory (PyCharm's default for a script in this folder).
    after `pip install tabpfn` to try TabPFN on the same features.
 5. `llm_baseline.py` → paste your DeepSeek (or OpenRouter) key at the top, pick `SPLIT`, run. Resumable.
    Then run `score.py` again; it picks up any `preds_*_<split>.jsonl` file automatically.
+6. `realdata_map.py` (optional) → maps the public truth-discovery sets (Stock, Flight, Book from
+   lunadong.com/fusionDataSets.htm) into the same case format. Download the zips into a `realdata/` folder next
+   to the script, run once with `INSPECT = True` to check the file roles it guessed (the roles and value formats
+   of the Oct 2026 downloads are already handled), then with `INSPECT = False` to write `cases_stock.jsonl`,
+   `cases_flight.jsonl`, `cases_book.jsonl`. Stock and Flight are sampled to 400 and 600 cases (`MAX_CASES`);
+   the nasdaq truth has no sign on Change % / Change $, so those two are compared by magnitude. Book author lists
+   are compared as surname multisets (initials and first names ignored); it is written twice, strict
+   (`cases_book.jsonl`: the list must equal the gold) and subset (`cases_book_subset.jsonl`: a partial list that
+   is a subset of the gold counts as evidence for it), because first-author-only listings dominate that set. `baselines.py` and `score.py` pick up
+   any `cases_<name>.jsonl` automatically. These sets have no time dimension (observed = arrived = day 0), so
+   they test source-conflict resolution, not supersession; `superseded` is never a true label there.
+
+`score.py` scores every method in a split on the cases all methods covered (`COMMON_CASES_ONLY = True`), so an
+LLM run on a subset is compared on the same cases as everything else; the header line says when that applies.
 
 Default sizes: train 2000, heldout 500, hard 200. `MAX_CASES_PER_SPLIT` in `baselines.py` and `MAX_CASES` in
 `llm_baseline.py` let you run a quick subset.
@@ -91,6 +105,13 @@ categorical fields. Save as `preds_<method>_<split>.jsonl` and `score.py` finds 
 If `newest_observed` scores above ~95% overall, the generator is too easy: raise the conflict knobs until the
 simple rules fail on the realistic cases (unit errors, stale re-imports, contamination) and hold there.
 The by-conflict-type table is the informative one; the overall number is dominated by the easy immutable fields.
+
+## Hub environment
+
+`recbench_env/` wraps the generator as a Prime Intellect / verifiers environment (single-turn, JSON answer,
+rewards = value accuracy + calibration (Brier) + label F1). It is self-contained (vendored copies of `gen.py`
+and `recbench_common.py`) and needs Python 3.10+ for `verifiers`; see `recbench_env/README.md` for `vf-eval`
+and `prime env push`.
 
 ## Known limits of v0
 

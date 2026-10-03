@@ -10,6 +10,7 @@ from recbench_common import FIELDS, cluster, load_jsonl, match, norm_value, writ
 
 # ============================================================ settings
 SPLITS = {"train": "cases_train.jsonl", "heldout": "cases_heldout.jsonl", "hard": "cases_hard.jsonl"}
+SCORE_REAL_DATA = True        # also run on any cases_<name>.jsonl written by realdata_map.py (stock/flight/book)
 METHODS = ["newest_observed", "newest_arrival", "source_priority", "majority_vote",
            "time_decayed_vote", "dawid_skene", "truthfinder"]
 MAX_CASES_PER_SPLIT = None     # e.g. 200 for a quick run; None = all
@@ -237,9 +238,19 @@ def predict_case(method: str, case: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def all_splits() -> Dict[str, str]:
+    import glob, os
+    splits = dict(SPLITS)
+    if SCORE_REAL_DATA:
+        for path in sorted(glob.glob("cases_*.jsonl")):
+            name = os.path.basename(path)[len("cases_"):-len(".jsonl")]
+            splits.setdefault(name, path)
+    return {k: v for k, v in splits.items() if os.path.exists(v)}
+
+
 def main() -> None:
     t0 = time.time()
-    for split, path in SPLITS.items():
+    for split, path in all_splits().items():
         cases = load_jsonl(path)
         if MAX_CASES_PER_SPLIT:
             cases = cases[:MAX_CASES_PER_SPLIT]

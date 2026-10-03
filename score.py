@@ -9,7 +9,7 @@ import os
 import random
 from typing import Any, Dict, List, Optional, Tuple
 
-from recbench_common import FIELD_TYPE, LABELS, load_jsonl, match, norm_value
+from recbench_common import FIELD_TYPE, LABELS, ftype_of, load_jsonl, match, norm_value
 
 # ============================================================ settings
 SPLITS = {"train": "cases_train.jsonl", "heldout": "cases_heldout.jsonl", "hard": "cases_hard.jsonl"}
@@ -135,7 +135,7 @@ def score(cases: List[Dict[str, Any]], preds: List[Dict[str, Any]]) -> Dict[str,
                 undec_conf.append(conf)
                 continue
             tags = [t for t in CONFLICT_TYPES if field in fields_with.get(t, set())]
-            rows.append({"field": field, "ftype": FIELD_TYPE[field], "conf": conf, "ok": ok, "tags": tags})
+            rows.append({"field": field, "ftype": ftype_of(field), "conf": conf, "ok": ok, "tags": tags})
             n_ok += ok
             n += 1
         per_case_acc.append((n_ok, n))
@@ -169,7 +169,7 @@ def score(cases: List[Dict[str, Any]], preds: List[Dict[str, Any]]) -> Dict[str,
     res["undecidable_mean_conf"] = sum(undec_conf) / len(undec_conf) if undec_conf else float("nan")
     res["undecidable_auto_rate"] = (sum(1 for c in undec_conf if c >= OVERWRITE_THRESHOLD) / len(undec_conf)) if undec_conf else float("nan")
     # by field type
-    for ft in sorted(set(FIELD_TYPE.values())):
+    for ft in sorted(set(r["ftype"] for r in rows)):
         sub = [r for r in rows if r["ftype"] == ft]
         res["acc:ftype:" + ft] = sum(r["ok"] for r in sub) / len(sub) if sub else float("nan")
     # by conflict type
@@ -211,11 +211,17 @@ def discover_methods(split: str) -> List[str]:
     return out
 
 
+def all_splits() -> Dict[str, str]:
+    splits = dict(SPLITS)
+    for path in sorted(glob.glob("cases_*.jsonl")):
+        name = os.path.basename(path)[len("cases_"):-len(".jsonl")]
+        splits.setdefault(name, path)
+    return {k: v for k, v in splits.items() if os.path.exists(v)}
+
+
 def main() -> None:
     all_rows = []
-    for split, cpath in SPLITS.items():
-        if not os.path.exists(cpath):
-            continue
+    for split, cpath in all_splits().items():
         cases = load_jsonl(cpath)
         methods = discover_methods(split)
         if not methods:
@@ -253,20 +259,23 @@ def main() -> None:
                      fmt(r["ece"]), fmt(r["brier"]), fmt(r["wrong_overwrite@0.9"], True), fmt(r["coverage@0.9"], True),
                      fmt(r["sel_acc@80"], True), fmt(r["undecidable_mean_conf"]), fmt(r["asrt_macro_f1"]),
                      fmt(r["asrt_auc_erroneous"])))
-        print("\n-- accuracy by conflict type (queries on fields affected by that conflict) --")
-        header = "%-16s" % "conflict" + "".join("%12s" % m[:11] for m in methods)
-        print(header)
-        for t in CONFLICT_TYPES:
-            n = results[methods[0]]["n:conflict:" + t]
-            line = "%-16s" % ("%s (n=%d)" % (t, n))[:16]
-            for m in methods:
-                line += "%12s" % fmt(results[m]["acc:conflict:" + t], True)
-            print(line)
+        has_conflicts = any(results[methods[0]]["n:conflict:" + t] > 0 for t in CONFLICT_TYPES)
+        if has_conflicts:
+            print("\n-- accuracy by conflict type (queries on fields affected by that conflict) --")
+            header = "%-16s" % "conflict" + "".join("%12s" % m[:11] for m in methods)
+            print(header)
+            for t in CONFLICT_TYPES:
+                n = results[methods[0]]["n:conflict:" + t]
+                line = "%-16s" % ("%s (n=%d)" % (t, n))[:16]
+                for m in methods:
+                    line += "%12s" % fmt(results[m]["acc:conflict:" + t], True)
+                print(line)
         print("\n-- accuracy by field type --")
-        for ft in sorted(set(FIELD_TYPE.values())):
+        ftypes = sorted(set(k[len("acc:ftype:"):] for m in methods for k in results[m] if k.startswith("acc:ftype:")))
+        for ft in ftypes:
             line = "%-16s" % ft
             for m in methods:
-                line += "%12s" % fmt(results[m]["acc:ftype:" + ft], True)
+                line += "%12s" % fmt(results[m].get("acc:ftype:" + ft, float("nan")), True)
             print(line)
         print("\n-- per-assertion validity (precision / recall) --")
         for m in methods:
