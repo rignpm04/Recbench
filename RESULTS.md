@@ -1,4 +1,4 @@
-# Results — recbench v0.2 (baselines, feature baseline, LLM baseline, public real-data sets)
+# Results — recbench v0.3 (baselines, feature baseline, LLM baseline, public real-data sets, reconciler v0)
 
 Run dates: Oct 3, 2026. Generator and baselines as committed in `pre-registration v0.1`. All numbers are from
 `score.py`; the full long-format table is `results.csv` (regenerable). Seven rule / truth-discovery methods,
@@ -114,6 +114,50 @@ The shifted prior costs the learned and LLM methods more than it costs the rules
 drops from 0.83 to 0.71 under shift; the LLM's over-flagging (valid recall 0.59–0.66, erroneous precision
 0.38–0.43) is the same on both splits.
 
+## Reconciler v0 (train_reconciler.py, Oct 6, 2026)
+
+0.62M parameters (d_model 128, 4 layers, 4 heads). Trained on 160,000 freshly generated `train`-split cases (8
+epochs × 20,000, never the same record twice), 47 minutes on a MacBook Pro (MPS). No real labels, no per-field
+features: each entry is typed features plus shuffled local ids for field, source and value cluster. Raw
+probabilities, no post-hoc calibration yet.
+
+| split | q_acc | 95% CI | ECE | wrong-OW@0.9 | cov@0.9 | sel@80 | undec conf | macro-F1 | erroneous P/R | AUC(err) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| hard (200) | 93.8% | 92.5–94.8 | 0.043 | 4.8% | 92.7% | 96.1% | 0.584 | 0.894 | 0.92 / 0.85 | 0.992 |
+| heldout (common 200) | 90.1% | 88.8–91.5 | 0.075 | 8.0% | 92.6% | 93.2% | 0.617 | 0.856 | 0.81 / 0.76 | 0.989 |
+| train (500, in-distribution) | 94.9% | 94.3–95.6 | 0.036 | 3.9% | 95.1% | 97.0% | 0.572 | 0.894 | 0.89 / 0.85 | 0.995 |
+
+Against the two strongest baselines on the same cases:
+
+| | hard: reconciler / feat_hgb / llm | heldout: reconciler / feat_hgb / llm |
+|---|---|---|
+| q_acc | 93.8 / 94.2 / 93.6 | 90.1 / 90.1 / 90.4 |
+| ECE | 0.043 / 0.019 / 0.041 | 0.075 / 0.036 / 0.021 |
+| wrong-OW@0.9 | 4.8 / 1.8 / 4.3 | 8.0 / 4.4 / 6.7 |
+| macro-F1 | 0.894 / 0.905 / 0.677 | 0.856 / 0.846 / 0.687 |
+| erroneous recall | 0.85 / 0.83 / 0.80 | 0.76 / 0.71 / 0.73 |
+
+By conflict type (hard): the reconciler leads on injection (88.0% vs 84.0% feature model, 80.0% LLM) and ties the
+feature model on wrong-field (84.7%); it trails on OCR digits (79.3% vs 81.0% / 84.5%) and stale recall (79.1% vs
+81.0% / 82.8%).
+
+Zero-shot on the real sets (never seen a stock, flight or book; same-day claims only):
+
+| set | reconciler | best classical (majority) | note |
+|---|---|---|---|
+| Flight | **88.9%** (87.8–89.8) | 85.4% | best method on the set; gates 96.1%, times 85.8% |
+| Stock | 83.1% | 93.2% | 556 entries / 55 sources per case, far outside the training prior |
+| Book strict | 71.0% | 77.0% | |
+
+Per-entry labeling collapses on the real sets (erroneous recall 0.00–0.10; it calls everything valid): the prior
+never contained snapshot-style records with dozens of sources and no time dimension.
+
+Prediction 7 at v0: accuracy equal to the feature model (target: above), erroneous recall 0.76 (target > 0.80),
+ECE 0.075 (target < 0.03), wrong-overwrite 8.0% (target < 2%). Three of the four misses are calibration; the
+feature model was isotonic-calibrated after training and this model is raw. Next: temperature scaling on held-out
+generated cases, a snapshot regime in the generator (many sources, many entries, same-day claims), then the
+scaling run.
+
 ## Public real-data sets (realdata_map.py; Stock, Flight, Book from lunadong.com)
 
 No time dimension: every claim is same-day, so these test source-conflict resolution only. `superseded` never
@@ -176,7 +220,7 @@ common 200 heldout cases every method scores 89.4% there. It was a subset effect
 
 ## Next
 
-1. Hub environment: `vf-eval` end-to-end run, `prime env push`, bounty application (`recbench_env/`).
-2. Temperature scaling for all baselines before paper tables.
-3. The reconciler. Predictions for it are items 7–8 in PREDICTIONS.md and remain blind; the real sets above
-   are its zero-shot transfer test.
+1. Reconciler: temperature scaling; generator snapshot regime; scaling run (data × 4, width × 2) on a rented GPU.
+2. Fair competitor: a small LLM fine-tuned on the identical generated cases.
+3. Temperature scaling for all baselines before paper tables; adversarial and ablation suites.
+4. Hub environment: `vf-eval` end-to-end run, `prime env push`, bounty application (`recbench_env/`).
