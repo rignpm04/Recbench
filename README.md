@@ -1,5 +1,5 @@
 # recbench v0.3 — longitudinal record reconciliation benchmark
-
+DOI: 10.5281/zenodo.23205119
 One pet. A hidden true timeline. The stream of assertions the app would have seen, from sources that err in
 different ways. Every assertion is labeled **valid / superseded / erroneous** against the hidden truth at "now",
 and every field has a current-value query. Methods are scored on accuracy, calibration, wrong-overwrite rate,
