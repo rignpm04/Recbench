@@ -4,3 +4,5 @@ results.csv
 __pycache__/
 realdata/
 .venv/
+raw_preds_*.jsonl
+reconciler_permuted.pt
