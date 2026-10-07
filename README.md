@@ -1,4 +1,4 @@
-# recbench v0.2 — longitudinal record reconciliation benchmark
+# recbench v0.3 — longitudinal record reconciliation benchmark
 
 One pet. A hidden true timeline. The stream of assertions the app would have seen, from sources that err in
 different ways. Every assertion is labeled **valid / superseded / erroneous** against the hidden truth at "now",
