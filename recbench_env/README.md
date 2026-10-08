@@ -26,14 +26,20 @@ exactly. No external data, no judge model.
 
 `load_environment(n_train=2000, n_eval=200, eval_split="hard", train_split="train", seed=20261001)`
 
-- `train`: the base generator settings.
+- `train`: the base generator settings; 15% of episodes are snapshot-regime (generator v2, see below).
+- `val`: train settings, separate seed (the parent benchmark tunes and calibrates its baselines on it).
 - `heldout`: shifted settings (species mix, units, drift, source cadence, lags, conflict rates all different) — a
   prior-shift test.
 - `hard`: train settings with every conflict knob turned up.
+- `snapshot`: many anonymous sources, generic fields, every claim on the same day, errors copied across sources —
+  the shape of the public truth-discovery sets (Stock / Flight / Book). Labels there are valid / erroneous only.
 
-Baselines on this task (from the parent benchmark, 200 `hard` episodes): newest-entry-wins 92.2% value accuracy
-with no error detection; a gradient-boosted feature model 94.2% / ECE 0.019 / erroneous-recall 0.83;
-DeepSeek (`deepseek-chat`, JSON mode) 93.6% / ECE 0.041 / erroneous-recall 0.80 but erroneous-precision 0.43.
+Generator v2 (recbench v0.4) also adds benign notes (ordinary note_text entries, so a note is not an injection by
+construction) and redundant / bad corrections (a "correction" of an entry that was already right).
+
+Baselines on this task are in the parent repo's RESULTS.md (tuned classical methods, a gradient-boosted feature
+model, DeepSeek zero-shot / few-shot / CoT self-consistency, and the recbench reconciler), all temperature-scaled
+on `val`.
 
 ## Run
 
@@ -56,4 +62,4 @@ prime env push        # from this folder
 ## Provenance
 
 Generator, scorer, baselines, results and pre-registered predictions: https://github.com/rignpm04/Recbench.
-`gen.py` and `recbench_common.py` here are copies of the repo-root files; copy them again when those change.
+`gen.py` and `recbench_common.py` here are copies of the repo-root files (v0.4); copy them again when those change.
