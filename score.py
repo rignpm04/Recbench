@@ -1,6 +1,6 @@
-# score.py -- scores every preds_<method>_<split>.jsonl against the cases (recbench v0)
-# Run from PyCharm after baselines.py (and llm_baseline.py). Prints tables, writes results.csv.
-# Python 3.9, stdlib only.
+# score.py -- scores every preds_<method>_<split>.jsonl against the cases (recbench v0.4)
+# Run from PyCharm after the methods (and after calibrate.py for the temperature-scaled tables).
+# Prints tables, writes results.csv. Python 3.9, stdlib only.
 
 import csv
 import glob
@@ -9,10 +9,12 @@ import os
 import random
 from typing import Any, Dict, List, Optional, Tuple
 
-from recbench_common import FIELD_TYPE, LABELS, ftype_of, load_jsonl, match, norm_value
+from recbench_common import FIELD_TYPE, LABELS, ftype_of, load_jsonl, match, norm_value, regime_of
 
 # ============================================================ settings
-SPLITS = {"train": "cases_train.jsonl", "heldout": "cases_heldout.jsonl", "hard": "cases_hard.jsonl"}
+SPLITS = {"train": "cases_train.jsonl", "heldout": "cases_heldout.jsonl", "hard": "cases_hard.jsonl",
+          "snapshot": "cases_snapshot.jsonl", "val": "cases_val.jsonl"}
+SKIP_SPLITS = ["val"]      # val is the tuning / calibration split: in-sample for tuned methods, so not a result table
 RESULTS_CSV = "results.csv"
 COMMON_CASES_ONLY = True   # score every method in a split on the cases ALL methods covered (apples to apples)
 ECE_BINS = 15
@@ -22,8 +24,11 @@ BOOTSTRAP = 300
 SEED = 7
 
 CONFLICT_TYPES = ["unit", "typo", "ocr_digit", "stale_recall", "stale_reimport", "duplicate", "correction",
-                  "contamination", "wrong_field", "injection"]
+                  "bad_correction", "contamination", "wrong_field", "injection", "benign_note",
+                  "source_error", "copied_error"]
 # (undecidable queries are excluded from accuracy; they are scored by confidence: undecC / undecidable_auto_rate)
+# v2 tags: bad_correction = a "correction" that made a right entry wrong; benign_note = ordinary note_text entry;
+# source_error / copied_error = snapshot-regime errors (independent / shared across sources).
 
 
 # ============================================================ metric helpers
@@ -112,10 +117,12 @@ def score(cases: List[Dict[str, Any]], preds: List[Dict[str, Any]]) -> Dict[str,
         pa = p["assertions"] if p else {}
         n_ok, n = 0, 0
         fields_with = {}
+        regime = regime_of(c)
         for a in c["assertions"]:
             for key in ([a["error_type"]] if a["error_type"] else []) + \
                        (["correction"] if a.get("corrects") is not None else []) + \
-                       (["duplicate"] if a.get("duplicate_of") is not None else []):
+                       (["duplicate"] if a.get("duplicate_of") is not None else []) + \
+                       (["benign_note"] if (a["source"] == "note_text" and not a["error_type"]) else []):
                 fields_with.setdefault(key, set()).add(a["field"])
         for q in c["queries"]:
             field = q["field"]
@@ -135,7 +142,7 @@ def score(cases: List[Dict[str, Any]], preds: List[Dict[str, Any]]) -> Dict[str,
                 undec_conf.append(conf)
                 continue
             tags = [t for t in CONFLICT_TYPES if field in fields_with.get(t, set())]
-            rows.append({"field": field, "ftype": ftype_of(field), "conf": conf, "ok": ok, "tags": tags})
+            rows.append({"field": field, "ftype": ftype_of(field), "conf": conf, "ok": ok, "tags": tags, "regime": regime})
             n_ok += ok
             n += 1
         per_case_acc.append((n_ok, n))
@@ -172,6 +179,11 @@ def score(cases: List[Dict[str, Any]], preds: List[Dict[str, Any]]) -> Dict[str,
     for ft in sorted(set(r["ftype"] for r in rows)):
         sub = [r for r in rows if r["ftype"] == ft]
         res["acc:ftype:" + ft] = sum(r["ok"] for r in sub) / len(sub) if sub else float("nan")
+    # by regime (longitudinal / snapshot / real)
+    for rg in sorted(set(r["regime"] for r in rows)):
+        sub = [r for r in rows if r["regime"] == rg]
+        res["acc:regime:" + rg] = sum(r["ok"] for r in sub) / len(sub) if sub else float("nan")
+        res["n:regime:" + rg] = len(sub)
     # by conflict type
     for t in CONFLICT_TYPES:
         sub = [r for r in rows if t in r["tags"]]
@@ -216,7 +228,7 @@ def all_splits() -> Dict[str, str]:
     for path in sorted(glob.glob("cases_*.jsonl")):
         name = os.path.basename(path)[len("cases_"):-len(".jsonl")]
         splits.setdefault(name, path)
-    return {k: v for k, v in splits.items() if os.path.exists(v)}
+    return {k: v for k, v in splits.items() if os.path.exists(v) and k not in SKIP_SPLITS}
 
 
 def main() -> None:
@@ -245,7 +257,14 @@ def main() -> None:
             for k, v in results[m].items():
                 all_rows.append((split, m, k, v))
 
-        print("\n=== %s split ===" % split)
+        n_cal = sum(1 for m in methods if loaded[m] and all("calibrated" in p for p in loaded[m]))
+        cal_note = ""
+        if n_cal == len(methods):
+            cal_note = " (all methods temperature-scaled on val)"
+        elif n_cal:
+            cal_note = " (%d of %d methods temperature-scaled on val; raw: %s)" % (
+                n_cal, len(methods), ", ".join(m for m in methods if not (loaded[m] and all("calibrated" in p for p in loaded[m]))))
+        print("\n=== %s split%s ===" % (split, cal_note))
         if common is not None and len(common) < len(cases):
             print("(scored on the %d cases every method covered; set COMMON_CASES_ONLY = False for full-split numbers)"
                   % len(common))
@@ -266,9 +285,20 @@ def main() -> None:
             print(header)
             for t in CONFLICT_TYPES:
                 n = results[methods[0]]["n:conflict:" + t]
+                if n == 0:
+                    continue
                 line = "%-16s" % ("%s (n=%d)" % (t, n))[:16]
                 for m in methods:
                     line += "%12s" % fmt(results[m]["acc:conflict:" + t], True)
+                print(line)
+        regimes = sorted(set(k[len("acc:regime:"):] for m in methods for k in results[m] if k.startswith("acc:regime:")))
+        if len(regimes) > 1:
+            print("\n-- accuracy by regime --")
+            for rg in regimes:
+                n = results[methods[0]].get("n:regime:" + rg, 0)
+                line = "%-16s" % ("%s (n=%d)" % (rg, n))[:16]
+                for m in methods:
+                    line += "%12s" % fmt(results[m].get("acc:regime:" + rg, float("nan")), True)
                 print(line)
         print("\n-- accuracy by field type --")
         ftypes = sorted(set(k[len("acc:ftype:"):] for m in methods for k in results[m] if k.startswith("acc:ftype:")))

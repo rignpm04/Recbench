@@ -1,28 +1,55 @@
-# baselines.py -- rule and truth-discovery baselines for recbench v0
-# Run from PyCharm after gen.py. Reads cases_*.jsonl, writes preds_<method>_<split>.jsonl.
-# Python 3.9, stdlib only.
+# baselines.py -- rule and truth-discovery baselines for recbench v0.4
+# Run from PyCharm after gen.py (and after tune.py, if you want the tuned settings).
+# Reads cases_*.jsonl, writes preds_<method>_<split>.jsonl. Python 3.9, stdlib only.
+#
+# Hyperparameters live in PARAMS. If tuned_params.json exists (written by tune.py from the `val` split) and
+# USE_TUNED is True, the tuned values replace the defaults -- same method names, so the paper tables are the tuned
+# ones and the untuned numbers only appear in tune.py's own printout.
 
+import json
 import math
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from recbench_common import FIELDS, cluster, load_jsonl, match, norm_value, write_jsonl
 
 # ============================================================ settings
-SPLITS = {"train": "cases_train.jsonl", "heldout": "cases_heldout.jsonl", "hard": "cases_hard.jsonl"}
+SPLITS = {"train": "cases_train.jsonl", "val": "cases_val.jsonl", "heldout": "cases_heldout.jsonl",
+          "hard": "cases_hard.jsonl", "snapshot": "cases_snapshot.jsonl"}
 SCORE_REAL_DATA = True        # also run on any cases_<name>.jsonl written by realdata_map.py (stock/flight/book)
 METHODS = ["newest_observed", "newest_arrival", "source_priority", "majority_vote",
            "time_decayed_vote", "dawid_skene", "truthfinder"]
 MAX_CASES_PER_SPLIT = None     # e.g. 200 for a quick run; None = all
+USE_TUNED = True               # apply tuned_params.json (from tune.py) when it exists
+TUNED_FILE = "tuned_params.json"
 
-SOURCE_PRIORITY = {"vet_pdf": 5, "email_forward": 4, "owner": 3, "extractor": 2, "note_text": 1}
-SOURCE_WEIGHT = {"vet_pdf": 1.0, "email_forward": 0.9, "owner": 0.7, "extractor": 0.5, "note_text": 0.3}
-DECAY_TAU_DAYS = 120.0
-WINDOW_DAYS = 60              # items for Dawid-Skene / TruthFinder = (field, 60-day window before now)
-DS_ITERS = 15
-TF_ITERS = 20
-TF_GAMMA = 0.3
-TF_DAMPEN = 0.5
+# defaults (v0.1 values); tune.py searches around these on the val split
+PARAMS: Dict[str, Any] = {
+    "source_priority": {"vet_pdf": 5, "email_forward": 4, "owner": 3, "extractor": 2, "note_text": 1},
+    "source_weight": {"vet_pdf": 1.0, "email_forward": 0.9, "owner": 0.7, "extractor": 0.5, "note_text": 0.3},
+    "decay_tau_days": 120.0,
+    "window_days": 60,            # items for Dawid-Skene / TruthFinder = (field, window before now)
+    "ds_iters": 15,
+    "ds_init_acc": 0.8,
+    "tf_iters": 20,
+    "tf_gamma": 0.3,
+    "tf_dampen": 0.5,
+}
+
+
+def set_params(update: Dict[str, Any]) -> None:
+    for k, v in update.items():
+        if k in PARAMS:
+            PARAMS[k] = v
+
+
+def load_tuned() -> Dict[str, Any]:
+    """tuned_params.json = {"<method>": {"params": {...}, ...}}; returns the merged per-method parameter sets."""
+    if not (USE_TUNED and os.path.exists(TUNED_FILE)):
+        return {}
+    with open(TUNED_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 # ============================================================ shared
@@ -44,6 +71,10 @@ def assign_labels(field: str, A: List[Dict[str, Any]], chosen: Any, chosen_conf:
             out[a["id"]] = {"label": "valid", "p_valid": q, "p_superseded": 0.0, "p_erroneous": 1.0 - q}
         elif a["observed_day"] < newest_support:
             out[a["id"]] = {"label": "superseded", "p_valid": 0.0, "p_superseded": q, "p_erroneous": 1.0 - q}
+        elif a["id"] in claim_conf:
+            # v0.4: a competing value with its own cluster confidence q -> erroneous with probability 1 - q
+            # (v0.1 used the chosen value's confidence here, which inverted the ranking for voting methods)
+            out[a["id"]] = {"label": "erroneous", "p_valid": 0.0, "p_superseded": q, "p_erroneous": 1.0 - q}
         else:
             out[a["id"]] = {"label": "erroneous", "p_valid": 0.0, "p_superseded": 1.0 - chosen_conf, "p_erroneous": chosen_conf}
     return out
@@ -68,7 +99,8 @@ def m_newest_arrival(field: str, A: List[Dict[str, Any]], now: int) -> Tuple[Any
 
 
 def m_source_priority(field: str, A: List[Dict[str, Any]], now: int) -> Tuple[Any, float, Dict[int, float]]:
-    a = max(A, key=lambda x: (SOURCE_PRIORITY.get(x["source"], 0), x["observed_day"], x["arrived_day"], x["id"]))
+    pr = PARAMS["source_priority"]
+    a = max(A, key=lambda x: (pr.get(x["source"], 0), x["observed_day"], x["arrived_day"], x["id"]))
     return nv(a), 1.0, {}
 
 
@@ -87,10 +119,12 @@ def m_majority_vote(field: str, A: List[Dict[str, Any]], now: int) -> Tuple[Any,
 
 
 def m_time_decayed_vote(field: str, A: List[Dict[str, Any]], now: int) -> Tuple[Any, float, Dict[int, float]]:
+    tau = float(PARAMS["decay_tau_days"])
+    sw = PARAMS["source_weight"]
     w = {}
     for a in A:
         age = max(0, now - a["observed_day"])
-        w[a["id"]] = math.exp(-age / DECAY_TAU_DAYS) * SOURCE_WEIGHT.get(a["source"], 0.5) * (a.get("extractor_conf") or 1.0)
+        w[a["id"]] = math.exp(-age / tau) * sw.get(a["source"], 0.5) * (a.get("extractor_conf") or 1.0)
     cl = cluster(field, [(a["id"], nv(a)) for a in A])
     total = sum(w.values()) or 1e-9
     best = max(cl, key=lambda c: sum(w[m] for m in c["members"]))
@@ -106,8 +140,9 @@ def m_time_decayed_vote(field: str, A: List[Dict[str, Any]], now: int) -> Tuple[
 # ============================================================ truth discovery
 def windows(field: str, A: List[Dict[str, Any]], now: int) -> Dict[int, List[Dict[str, Any]]]:
     items: Dict[int, List[Dict[str, Any]]] = {}
+    wd = int(PARAMS["window_days"])
     for a in A:
-        k = (now - a["observed_day"]) // WINDOW_DAYS
+        k = (now - a["observed_day"]) // wd
         items.setdefault(k, []).append(a)
     return items
 
@@ -125,9 +160,9 @@ def m_dawid_skene(field: str, A: List[Dict[str, Any]], now: int) -> Tuple[Any, f
         claims = [(a["source"], idx[a["id"]], a["id"]) for a in group]
         structured[k] = (cl, claims)
     sources = sorted(set(a["source"] for a in A))
-    acc = {s: 0.8 for s in sources}
+    acc = {s: float(PARAMS["ds_init_acc"]) for s in sources}
     post: Dict[int, List[float]] = {}
-    for _ in range(DS_ITERS):
+    for _ in range(int(PARAMS["ds_iters"])):
         # E-step
         for k, (cl, claims) in structured.items():
             K = len(cl)
@@ -162,6 +197,8 @@ def m_dawid_skene(field: str, A: List[Dict[str, Any]], now: int) -> Tuple[Any, f
 
 def m_truthfinder(field: str, A: List[Dict[str, Any]], now: int) -> Tuple[Any, float, Dict[int, float]]:
     """TruthFinder (Yin, Han & Yu 2008), simplified: iterate source trust <-> claim confidence."""
+    gamma = float(PARAMS["tf_gamma"])
+    dampen = float(PARAMS["tf_dampen"])
     items = windows(field, A, now)
     structured = {}
     for k, group in items.items():
@@ -173,7 +210,7 @@ def m_truthfinder(field: str, A: List[Dict[str, Any]], now: int) -> Tuple[Any, f
     sources = sorted(set(a["source"] for a in A))
     trust = {s: 0.9 for s in sources}
     conf: Dict[int, List[float]] = {}
-    for _ in range(TF_ITERS):
+    for _ in range(int(PARAMS["tf_iters"])):
         for k, (cl, srcs_of) in structured.items():
             sig = []
             for ci, c in enumerate(cl):
@@ -188,7 +225,7 @@ def m_truthfinder(field: str, A: List[Dict[str, Any]], now: int) -> Tuple[Any, f
                         if cj != ci and match(field, c["value"], d["value"] * 1.0):
                             extra += 0.5 * sig[cj]
                 sig2.append(sig[ci] + extra)
-            conf[k] = [1.0 / (1.0 + math.exp(-TF_GAMMA * s)) for s in sig2]
+            conf[k] = [1.0 / (1.0 + math.exp(-gamma * s)) for s in sig2]
         new_trust = {}
         for s in sources:
             vals = []
@@ -197,7 +234,7 @@ def m_truthfinder(field: str, A: List[Dict[str, Any]], now: int) -> Tuple[Any, f
                     vals.extend([conf[k][ci]] * srcs.count(s))
             new_trust[s] = sum(vals) / len(vals) if vals else trust[s]
         for s in sources:
-            trust[s] = TF_DAMPEN * trust[s] + (1 - TF_DAMPEN) * new_trust[s]
+            trust[s] = dampen * trust[s] + (1 - dampen) * new_trust[s]
     latest = min(structured.keys())
     cl, srcs_of = structured[latest]
     cf = conf[latest]
@@ -239,7 +276,7 @@ def predict_case(method: str, case: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def all_splits() -> Dict[str, str]:
-    import glob, os
+    import glob
     splits = dict(SPLITS)
     if SCORE_REAL_DATA:
         for path in sorted(glob.glob("cases_*.jsonl")):
@@ -250,14 +287,24 @@ def all_splits() -> Dict[str, str]:
 
 def main() -> None:
     t0 = time.time()
+    tuned = load_tuned()
+    defaults = json.loads(json.dumps(PARAMS))
+    if tuned:
+        print("using tuned parameters from %s for: %s" % (TUNED_FILE, ", ".join(sorted(tuned))))
+    else:
+        print("no %s found (run tune.py first) -- using default parameters" % TUNED_FILE)
     for split, path in all_splits().items():
         cases = load_jsonl(path)
         if MAX_CASES_PER_SPLIT:
             cases = cases[:MAX_CASES_PER_SPLIT]
         for method in METHODS:
+            set_params(defaults)
+            if method in tuned:
+                set_params(tuned[method].get("params", {}))
             preds = [predict_case(method, c) for c in cases]
             write_jsonl("preds_%s_%s.jsonl" % (method, split), preds)
-            print("%-8s %-18s %d cases" % (split, method, len(preds)))
+            print("%-9s %-18s %d cases%s" % (split, method, len(preds), "  (tuned)" if method in tuned else ""))
+    set_params(defaults)
     print("done in %.1fs" % (time.time() - t0))
 
 

@@ -1,5 +1,5 @@
-# recbench_common.py -- shared helpers for the record-reconciliation benchmark (v0)
-# Python 3.9, stdlib only. Imported by gen.py, baselines.py, score.py, llm_baseline.py.
+# recbench_common.py -- shared helpers for the record-reconciliation benchmark (v0.4)
+# Python 3.9, stdlib only. Imported by gen.py, baselines.py, tune.py, calibrate.py, score.py, llm_baseline.py.
 
 import json
 from typing import Any, Dict, List, Optional, Tuple
@@ -188,11 +188,19 @@ def truth_at(case: Dict[str, Any], field: str, day: int) -> Any:
 
 
 def current_truth(case: Dict[str, Any], field: str) -> Any:
-    """Current true value: generator cases via truth_at; real-data cases via their static truth_values."""
+    """Current true value: generator cases via truth_at; snapshot / real-data cases via their static truth_values."""
     if "truth_values" in case:
         v = case["truth_values"].get(field)
         return None if v is None else norm_value(field, v)
     return truth_at(case, field, case["now_day"])
+
+
+def regime_of(case: Dict[str, Any]) -> str:
+    """'longitudinal' (pet timeline), 'snapshot' (generator v2 same-day regime) or 'real' (realdata_map.py)."""
+    r = case.get("regime")
+    if r:
+        return r
+    return "longitudinal" if "truth" in case else "real"
 
 
 def serialize_assertion(a: Dict[str, Any]) -> str:

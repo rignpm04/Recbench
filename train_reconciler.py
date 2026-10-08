@@ -1,4 +1,4 @@
-# train_reconciler.py -- the PFN-style reconciler (recbench v0.3)
+# train_reconciler.py -- the PFN-style reconciler (recbench v0.4)
 #
 # A small transformer that reads a record as a SET of assertions (value, unit, two dates, source, confidence) and
 # outputs (a) valid / superseded / erroneous probabilities for every assertion and (b) for every queried field, a
@@ -8,6 +8,12 @@
 #
 # Needs: torch, numpy (python 3.10+ venv). From PyCharm: set this script's interpreter to recbench_env/.venv and
 # press Run. Prints metrics every epoch. Checkpoint: reconciler.pt (set EVAL_ONLY = True to just predict with it).
+#
+# Leak guards (v0.4): the encoder only ever sees a scrubbed copy of each assertion holding the OBSERVABLE_KEYS
+# below (never label / error_type, never the case's truth); the targets are read separately. PERMUTE_LABELS = True
+# trains a control model on shuffled labels (expected: chance-level results) to show the scores come from the
+# training signal and not from the pipeline. Heldout is only monitored per epoch, never used for selection:
+# the reported model is always the last epoch with the fixed settings below.
 
 import json
 import math
@@ -44,9 +50,19 @@ VAL_CASES = 300                 # heldout cases used for the per-epoch metrics
 EVAL_ONLY = False               # True: load CHECKPOINT and only write predictions
 CHECKPOINT = "reconciler.pt"
 METHOD_NAME = "reconciler"
-EVAL_SPLITS = {"train": ("cases_train.jsonl", 500), "heldout": ("cases_heldout.jsonl", None),
-               "hard": ("cases_hard.jsonl", None)}
+PERMUTE_LABELS = False          # True = control run on shuffled labels (writes reconciler_permuted.pt / preds_reconciler_permuted_*)
+EVAL_SPLITS = {"train": ("cases_train.jsonl", 500), "val": ("cases_val.jsonl", None),
+               "heldout": ("cases_heldout.jsonl", None), "hard": ("cases_hard.jsonl", None),
+               "snapshot": ("cases_snapshot.jsonl", None)}
 REAL_SPLITS = ["stock", "flight", "book", "book_subset"]     # scored zero-shot when cases_<name>.jsonl exists
+if PERMUTE_LABELS:                # the control run is short: it only has to show chance-level numbers
+    CHECKPOINT = "reconciler_permuted.pt"
+    METHOD_NAME = "reconciler_permuted"
+    EPOCHS, N_TRAIN_CASES = 2, 5000
+
+# the only assertion keys the encoder may read (label, error_type and the case truth are never on this list)
+OBSERVABLE_KEYS = ("id", "field", "value", "unit", "observed_day", "arrived_day", "source", "extractor_conf",
+                   "text", "corrects", "duplicate_of")
 
 FTYPES = ["immutable_cat", "immutable_num", "drift_num", "regime_cat", "event_day", "num_rel", "num_abs", "cat"]
 N_LOCAL_FIELDS = 32
@@ -56,11 +72,20 @@ N_NUM_FEATS = 16
 
 
 # ============================================================ encoding
-def encode_case(case: Dict[str, Any], rng: random.Random, with_labels: bool = True) -> Optional[Dict[str, Any]]:
-    """Turn one case into index/feature arrays plus the query structure. Uses only observable fields."""
-    A = case["assertions"][:MAX_ENTRIES]
-    if not A:
+def encode_case(case: Dict[str, Any], rng: random.Random, with_labels: bool = True,
+                permute: bool = False) -> Optional[Dict[str, Any]]:
+    """Turn one case into index/feature arrays plus the query structure.
+    The encoder works on a scrubbed copy of the assertions (OBSERVABLE_KEYS only); labels and the true current
+    value are read from the original case only when with_labels is set, and only into the target arrays."""
+    raw = case["assertions"][:MAX_ENTRIES]
+    if not raw:
         return None
+    A = [{k: a.get(k) for k in OBSERVABLE_KEYS} for a in raw]
+    gold = {a["id"]: a.get("label") for a in raw} if with_labels else {}
+    if permute and with_labels:
+        shuffled = [gold[a["id"]] for a in raw]
+        rng.shuffle(shuffled)
+        gold = {a["id"]: lab for a, lab in zip(raw, shuffled)}
     now = case["now_day"]
     n = len(A)
     fields = sorted(set(a["field"] for a in A))
@@ -138,7 +163,7 @@ def encode_case(case: Dict[str, Any], rng: random.Random, with_labels: bool = Tr
                 min(1.0, len(group) / 80.0),
             ]
             if with_labels:
-                labels[i] = LABELS.index(a["label"])
+                labels[i] = LABELS.index(gold[a["id"]])
 
     # queries: for each queried field, the candidate clusters and (if labels) the index of the true one
     queries = []
@@ -155,6 +180,8 @@ def encode_case(case: Dict[str, Any], rng: random.Random, with_labels: bool = Tr
                 if match(f, c["value"], truth):
                     target = ci
                     break
+            if permute and len(cl) > 0:
+                target = rng.randrange(len(cl))
         queries.append({"field": f, "member_ids": members, "values": [c["value"] for c in cl],
                         "target": target, "decidable": q["decidable"]})
     for q in queries:
@@ -317,6 +344,9 @@ def main() -> None:
     model = Reconciler().to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print("device %s | params %.2fM | d_model %d layers %d heads %d" % (device, n_params / 1e6, D_MODEL, N_LAYERS, N_HEADS))
+    print("encoder input keys: %s" % ", ".join(OBSERVABLE_KEYS))
+    if PERMUTE_LABELS:
+        print("*** PERMUTE_LABELS control run: training targets are shuffled; results should be at chance ***")
 
     val_cases = load_jsonl(EVAL_SPLITS["heldout"][0])[:VAL_CASES] if os.path.exists(EVAL_SPLITS["heldout"][0]) else []
     eval_rng = random.Random(SEED + 777)
@@ -331,7 +361,7 @@ def main() -> None:
             tot, tot_e, tot_q, nb = 0.0, 0.0, 0.0, 0
             for s in range(steps_per_epoch):
                 cases = gen_cases(BATCH_CASES, seed=SEED * 10 ** 6 + epoch * 10 ** 4 + s)
-                enc = [e for e in (encode_case(c, enc_rng) for c in cases) if e is not None]
+                enc = [e for e in (encode_case(c, enc_rng, permute=PERMUTE_LABELS) for c in cases) if e is not None]
                 batch = collate(enc, device)
                 loss, le, lq = step_loss(model, batch)
                 opt.zero_grad(); loss.backward()
@@ -361,7 +391,7 @@ def main() -> None:
         preds, stats = predict(model, cases, device, random.Random(SEED + 5), batch_size=bs)
         write_jsonl("preds_%s_%s.jsonl" % (METHOD_NAME, split), preds)
         print("%-12s %4d cases | %s" % (split, len(preds), quick_metrics(stats)))
-    print("done. now run score.py")
+    print("done. now run calibrate.py (temperature scaling on val), then score.py")
 
 
 if __name__ == "__main__":
