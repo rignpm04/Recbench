@@ -101,28 +101,55 @@ def pred_path(method: str, split: str) -> str:
 
 
 def ensure_raw(method: str, split: str) -> str:
-    """Back up the untouched predictions once; always return the raw file path."""
+    """Back up the untouched predictions once; always return the raw file path.
+    If the preds file has grown since the backup (a resumable run appended cases after calibrate.py ran), the new,
+    unscaled records are merged into the backup so nothing is lost."""
     rp, pp = raw_path(method, split), pred_path(method, split)
     if not os.path.exists(rp):
         shutil.copyfile(pp, rp)
+        return rp
+    if os.path.exists(pp):
+        raw_ids = set(p["case_id"] for p in load_jsonl(rp))
+        extra = [p for p in load_jsonl(pp) if p["case_id"] not in raw_ids and "calibrated" not in p]
+        if extra:
+            with open(rp, "a", encoding="utf-8") as f:
+                for p in extra:
+                    f.write(json.dumps(p, ensure_ascii=False) + "\n")
+            print("  %s/%s: merged %d new cases into the raw backup" % (method, split, len(extra)))
     return rp
 
 
+def known_splits() -> List[str]:
+    """Every split with a cases file, longest name first (so book_subset is matched before book)."""
+    names = [os.path.basename(p)[len("cases_"):-len(".jsonl")] for p in glob.glob("cases_*.jsonl")]
+    return sorted(set(names), key=lambda s: -len(s))
+
+
+def split_method(filename: str):
+    """'preds_<method>_<split>.jsonl' / 'raw_preds_...' -> (method, split) using the known split names."""
+    name = os.path.basename(filename)
+    name = name[len("raw_preds_"):] if name.startswith("raw_") else name[len("preds_"):]
+    name = name[:-len(".jsonl")]
+    for s in known_splits():
+        if name.endswith("_" + s):
+            return name[:-len(s) - 1], s
+    return None, None
+
+
 def methods_with_val() -> List[str]:
-    out = []
-    for path in sorted(glob.glob("preds_*_%s.jsonl" % VAL_SPLIT) + glob.glob("raw_preds_*_%s.jsonl" % VAL_SPLIT)):
-        name = os.path.basename(path)
-        name = name[len("raw_preds_"):] if name.startswith("raw_") else name[len("preds_"):]
-        out.append(name[:-len("_%s.jsonl" % VAL_SPLIT)])
-    return sorted(set(out))
+    out = set()
+    for path in glob.glob("preds_*_%s.jsonl" % VAL_SPLIT) + glob.glob("raw_preds_*_%s.jsonl" % VAL_SPLIT):
+        m, s = split_method(path)
+        if m and s == VAL_SPLIT:
+            out.add(m)
+    return sorted(out)
 
 
 def splits_of(method: str) -> List[str]:
-    out = set()
-    for path in glob.glob("preds_%s_*.jsonl" % method) + glob.glob("raw_preds_%s_*.jsonl" % method):
-        name = os.path.basename(path)
-        name = name[len("raw_preds_"):] if name.startswith("raw_") else name[len("preds_"):]
-        out.add(name[len(method) + 1:-len(".jsonl")])
+    out = []
+    for s in known_splits():
+        if os.path.exists(pred_path(method, s)) or os.path.exists(raw_path(method, s)):
+            out.append(s)
     return sorted(out)
 
 
@@ -201,7 +228,7 @@ def main() -> None:
     if not methods:
         print("no predictions on the %s split found; run the methods on cases_val.jsonl first" % VAL_SPLIT)
         return
-    all_methods = sorted(set(os.path.basename(p)[len("preds_"):].rsplit("_", 1)[0] for p in glob.glob("preds_*.jsonl")))
+    all_methods = sorted(set(m for m, _ in (split_method(p) for p in glob.glob("preds_*.jsonl")) if m))
     skipped = [m for m in all_methods if m not in methods]
     report: Dict[str, Any] = {}
     print("%-20s %7s %7s | %s" % ("method", "T_query", "T_entry", "ECE / wrong-OW@0.9 before -> after, per split"))
