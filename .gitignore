@@ -6,3 +6,4 @@ realdata/
 .venv/
 raw_preds_*.jsonl
 reconciler_permuted.pt
+replies_*.jsonl
