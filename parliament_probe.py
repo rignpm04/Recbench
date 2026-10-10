@@ -65,6 +65,8 @@ WIKIDATA_PARL_ID = "P10428"         # Wikidata property "parliament.uk member ID
 PEOPLE_JSON_URL = ("https://raw.githubusercontent.com/mysociety/parlparse/"
                    "5b50bb67fcdffdf81e7c3d2501114ce83ebd53be/members/people.json")
 PAUSE_S = {"parliament": 0.2, "wikimedia": 0.25, "github": 0.0}   # pause after each download
+# Read requests go one at a time with a pause and no "maxlag": on Wikidata, maxlag also counts the query service's lag,
+# which can stay high for hours and is meant to slow down bots that edit, not readers.
 TIMEOUT_S = 90
 MAX_RETRIES = 8
 
@@ -193,7 +195,10 @@ def get_json(base: str, params: Optional[Dict[str, Any]] = None, kind: str = "wi
             if code in ("maxlag", "ratelimited") and waits <= 30:
                 time.sleep(5.0 if code == "maxlag" else 30.0)
                 continue
-            if (code.startswith("internal_api_error") or code in ("readonly", "timeout")) and waits <= 4:
+            info = str(err.get("info", "") if isinstance(err, dict) else "").lower()
+            transient = code.startswith("internal_api_error") or code in ("readonly", "timeout") or \
+                "search" in code or "too busy" in info or "try again" in info
+            if transient and waits <= 4:
                 print("      Wikimedia API error %s, retrying in 20 s" % code, flush=True)
                 time.sleep(20.0)
                 continue
@@ -215,7 +220,7 @@ def mw_revisions(api: str, params: Dict[str, Any], label: str = "", follow: bool
     """Revisions of a prop=revisions query. follow=True follows 'continue' to the end; follow=False makes one request
     (used for 'the last revision before a date', where 'continue' would walk back through the whole history).
     transform(revision) is applied to each revision as it arrives, so page texts are not all held in memory."""
-    base = dict(params, action="query", format="json", formatversion="2", maxlag="5")
+    base = dict(params, action="query", format="json", formatversion="2")
     cont: Dict[str, str] = {}
     out: List[Any] = []
     n = 0
@@ -949,7 +954,7 @@ def wd_by_parliament_id(mid: int) -> List[str]:
     """Wikidata items carrying this parliament.uk member ID (search index)."""
     d = get_json(WIKIDATA_API, {"action": "query", "list": "search", "srnamespace": "0", "srlimit": "5",
                                 "srsearch": "haswbstatement:%s=%d" % (WIKIDATA_PARL_ID, mid), "format": "json",
-                                "formatversion": "2", "maxlag": "5"}, "wikimedia")
+                                "formatversion": "2"}, "wikimedia")
     return [h.get("title") for h in ((d or {}).get("query") or {}).get("search") or []
             if re.match(r"^Q\d+$", str(h.get("title")))]
 
@@ -975,8 +980,8 @@ def wd_entities(ids: List[str], props: str, extra: Dict[str, str]) -> Dict[str, 
     out: Dict[str, dict] = {}
     ids = sorted(set(ids))
     for i in range(0, len(ids), 50):
-        p = dict({"action": "wbgetentities", "ids": "|".join(ids[i:i + 50]), "props": props, "format": "json",
-                  "maxlag": "5"}, **extra)
+        p = dict({"action": "wbgetentities", "ids": "|".join(ids[i:i + 50]), "props": props, "format": "json"},
+                 **extra)
         d = get_json(WIKIDATA_API, p, "wikimedia")
         for k, v in ((d or {}).get("entities") or {}).items():
             out[k] = v
