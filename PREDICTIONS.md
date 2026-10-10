@@ -252,3 +252,24 @@ val 600 (63 snapshot), 29,875 / 4,289; heldout 500, 35,127 / 3,788; hard 200, 16
 - Item 27: if LoRA beats the reconciler by >= 1.5 points on both `test_hard` and `test_heldout` with at least the
   reconciler's training data, the paper's claim moves to the generated data; the reconciler becomes the cheap
   baseline.
+
+## Amendment (Oct 10, 2026, before any LLM run; committed with `llm_baseline.py` and `llm_costs.py`)
+
+No prediction above is edited. The LLM protocol changes as follows, because of how the Claude API works today:
+
+- **Claude through Anthropic's own API** (`PROVIDER = "anthropic"`, model `claude-sonnet-5-5`, Claude Sonnet 5.5),
+  not OpenRouter. "Current Sonnet via OpenRouter" in item 22 reads "current Sonnet (Claude Sonnet 5.5) via the
+  Anthropic API". Same prompts, parser, cases, forms and method names (`llm_claude*`).
+- **Temperature:** Claude Sonnet 5.5 rejects any temperature other than its default 1.0, so all three Claude forms
+  sample at 1.0 (zero-shot is not greedy; the five CoT samples are drawn at 1.0, not 0.7). DeepSeek keeps 0 and 0.7.
+- **Thinking:** Claude Sonnet 5.5 thinks before answering by default; every Claude request sets
+  `thinking: {"type": "between_tools"}`, which turns that off, so Claude, like DeepSeek's chat model, reasons only
+  where the CoT prompt asks it to.
+- **Message Batches API** for the Claude runs: the same requests at half price, asynchronously.
+- **Output cap 16,000 tokens per reply for both providers** (was 8,000), so CoT replies are not cut off;
+  `llm_costs.py` counts replies that hit the cap.
+- **Phase-1 DeepSeek check** adds CoT on `val` (`BATCH_RUNS_DEV`) to measure cut-offs with the new prompt before the
+  final runs.
+- **Items 27 (LoRA) and 28 (scaling) are deferred to v0.6.** They are not run in v0.5. If they are run, it is in v0.6
+  with their own pre-registration, each model frozen on development data before it touches a test split, and
+  reported whatever it shows.

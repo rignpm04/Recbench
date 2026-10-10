@@ -30,8 +30,9 @@ frozen; `hard` and `heldout` are development splits (they were studied in detail
    training cases; its grid on `val`. Seeds 1, 2, 3 (`SEED`; 2 and 3 reuse seed 1's settings). Saves `<name>.pkl`.
 6. `train_reconciler.py` (venv) → the reconciler, seeds 1, 2, 3 (`SEED`), ~50 min each; seed 1 with
    `LEAK_TEST = True`. Then the two controls: `PERMUTE = "within"` and `PERMUTE = "cross"` (~10 min each).
-7. `llm_baseline.py` with `BATCH_RUNS = BATCH_RUNS_DEV` (DeepSeek zero-shot on `val` and `hard`; ~$1): parsing and
-   prompt check.
+7. `llm_baseline.py` with `BATCH_RUNS = BATCH_RUNS_DEV` (DeepSeek zero-shot on `val` and `hard`, CoT on `val`; ~$3–5):
+   parsing, prompt and cut-off check. Claude: once, `PROVIDER = "anthropic"` with `SMOKE = True` (3 train cases per
+   form into `smoke_*` files, never scored; checks the key, the model id and the batch path for under $1).
 8. `calibrate.py` → one temperature per method fitted on `val`; rewrites every `preds_*` (raw copies `raw_preds_*`).
 9. `score.py` → the tables and `results.csv`. `flight_diag.py` (optional) → the Flight diagnostic on `flight_dev`.
 
@@ -45,7 +46,9 @@ frozen; `hard` and `heldout` are development splits (they were studied in detail
     `EVAL_ONLY = True` (seeds 1-3, both controls; seed 1 with `LEAK_TEST = True`, so the leak test covers the test
     splits).
 12. `llm_baseline.py` with `BATCH_RUNS = BATCH_RUNS_FINAL`, once with `PROVIDER = "deepseek"` and once with
-    `PROVIDER = "claude"` (first 200 cases of each test split, plus `val` for calibration).
+    `PROVIDER = "anthropic"` (first 200 cases of each test split, plus `val` for calibration). Claude runs through
+    the Message Batches API: the script submits the batches and waits (usually under an hour; press Run again later
+    if you stop it).
 13. `calibrate.py`, `score.py`, `llm_costs.py`.
 
 `score.py` scores every method in a split on the cases all methods covered (`COMMON_CASES_ONLY = True`) and, when an
@@ -74,8 +77,11 @@ no queries counts as covered by every method). The `val` split is never a result
   Temperature scaling is monotone, so accuracy and labels are untouched.
 - **LLM.** Three forms of the same model — zero-shot JSON, few-shot (2 worked train cases with gold answers),
   chain-of-thought + self-consistency (5 samples; value by majority, confidence = agreement × stated confidence) —
-  for DeepSeek and for Claude (via OpenRouter). The prompt states each field's tolerance and the label rules
-  (including that "erroneous" comes first: a value wrong when stated is erroneous even if it matches today's).
+  for DeepSeek and for Claude (Sonnet 5.5, through Anthropic's API and its Batch API). The prompt states each field's
+  tolerance and the label rules (including that "erroneous" comes first: a value wrong when stated is erroneous even
+  if it matches today's). Output cap 16,000 tokens per reply. Claude Sonnet 5.5 accepts no temperature (it samples
+  at 1.0 in every form; DeepSeek uses 0 and 0.7) and its up-front thinking is turned off, so it reasons only where
+  the CoT prompt asks (PREDICTIONS.md, v0.5 amendment).
 - **Leak test.** `train_reconciler.py` with `LEAK_TEST = True` strips every key the encoder may not read from the case
   files (labels, error types, the truth, query answers / types / decidable flags, knobs, snapshot parameters,
   `undecidable_ids`; case ids replaced by opaque ones) and checks that every prediction is identical, unrounded. The

@@ -20,25 +20,26 @@ the LLM forms are also compared pairwise. The paper reports one table from one b
 | 9 | DeepSeek, zero-shot | prompted LLM, JSON output, temperature 0 | no | Can an untrained LLM do it from instructions alone? | prompt now states the grading rules |
 | 10 | DeepSeek, few-shot | + 2 solved training cases in the prompt | no | Does showing worked examples close the gap? | same |
 | 11 | DeepSeek, CoT + self-consistency | reason (≤ 250 words), 5 samples at T=0.7, majority vote, confidence = agreement × stated confidence | no | Does reasoning + voting close the gap, and at what cost? | same |
-| 12 | Claude (current Sonnet), zero-shot | same prompt and output format as #9 (OpenRouter) | no | Does a frontier model change the answer? | phase 2 |
+| 12 | Claude Sonnet 5.5, zero-shot | same prompt and output format as #9 (Anthropic API, Batch API; temperature fixed at 1.0 by the API; up-front thinking off) | no | Does a frontier model change the answer? | phase 2 |
 | 13 | Claude, few-shot | same as #10 | no | Same question, with examples | phase 2 |
-| 14 | Claude, CoT + self-consistency | same as #11 | no | Same question, strongest prompted form | phase 2 |
-| 15 | Fine-tuned small LLM (LoRA, Qwen-class) | an open LLM trained on generated cases | yes | Is the gain from the training data or from the small typed model? | optional; the number of training cases is stated, and below 160,000 the row is "data-limited" |
-| 16 | Reconciler at 3 sizes (0.6M / ~2.5M / ~10M, data ×4) | our model, scaling curve | yes | Does it improve with scale, or is the task saturated? | optional; judged on the test splits and val log-loss |
+| 14 | Claude, CoT + self-consistency | same as #11, samples at 1.0 | no | Same question, strongest prompted form | phase 2 |
+| 15 | Fine-tuned small LLM (LoRA, Qwen-class) | an open LLM trained on generated cases | yes | Is the gain from the training data or from the small typed model? | deferred to v0.6; the number of training cases is stated, and below 160,000 the row is "data-limited" |
+| 16 | Reconciler at 3 sizes (0.6M / ~2.5M / ~10M, data ×4) | our model, scaling curve | yes | Does it improve with scale, or is the task saturated? | deferred to v0.6; judged on the test splits and val log-loss |
 | 17 | Reconciler, permuted labels | within-case shuffle and cross-case (targets drawn from the label marginal) | yes (shuffled) | Do the scores come from learning? | both re-run; the leak itself is tested by the scrub test |
 | 18 | Jev | probability-native decision model, API | no | Does a model built to output probabilities beat text output? | optional |
 
 ## Notes
 
 - **Cost column for the paper:** rules and classical methods run in microseconds per record; the feature model and
-  the reconciler in milliseconds; DeepSeek zero-shot ≈ $0.002 per record and seconds; CoT ≈ 5× that. Claude: check
-  OpenRouter's rate for the Sonnet id you use and record it in RESULTS.md. DeepSeek's ten v0.4 runs used ~12M input
-  and ~13M output tokens; the Claude batch will be of that order.
-- **How to run #12–14:** `llm_baseline.py` with `PROVIDER = "claude"` (paste the OpenRouter key, the exact Claude
-  Sonnet model id and its prices into `PROVIDERS["claude"]`), `BATCH_RUNS = BATCH_RUNS_FINAL` after the test splits
-  exist. `val` is included so `calibrate.py` can scale it.
-- **CoT truncation:** the reported runs use an 8,000-token output cap and a 250-word reasoning limit (v0.4: 1 dropped
-  sample in 3,000).
+  the reconciler in milliseconds; DeepSeek zero-shot ≈ $0.002 per record and seconds; CoT ≈ 5× that. Claude Sonnet
+  5.5: $2 / $10 per million input / output tokens, half that through the Batch API (record the rates in RESULTS.md).
+  DeepSeek's ten v0.4 runs used ~12M input and ~13M output tokens; the Claude batch will be of that order (~$100 at
+  the batch price; Claude's tokenizer counts more tokens for the same text).
+- **How to run #12–14:** `llm_baseline.py` with `PROVIDER = "anthropic"` (paste the Anthropic key into
+  `PROVIDERS["anthropic"]`), `BATCH_RUNS = BATCH_RUNS_FINAL` after the test splits exist. `val` is included so
+  `calibrate.py` can scale it.
+- **CoT truncation:** v0.5 uses a 16,000-token output cap per reply and a 250-word reasoning limit (v0.4: 8,000
+  tokens, 1 dropped sample in 3,000); `llm_costs.py` counts replies that hit the cap.
 - **What the reconciler has to beat:** with equal data, the feature model on accuracy, per-entry labels and
   wrong-overwrite on the schema the features were written for; the best LLM form on the semantic conflicts; less
   degradation under the shifted prior; and, because it needs no per-field code, zero-shot transfer to the public sets.
