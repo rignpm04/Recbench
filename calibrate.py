@@ -1,4 +1,4 @@
-# calibrate.py -- one post-hoc temperature scaling for EVERY method (recbench v0.4)
+# calibrate.py -- one post-hoc temperature scaling for EVERY method (recbench v0.5; v0.5 prints full split names)
 # Run from PyCharm after every method has written its predictions (baselines.py, feature_baseline.py,
 # train_reconciler.py, llm_baseline.py -- the LLM needs a run on the val split too). Python 3.9, stdlib only.
 #
@@ -10,6 +10,9 @@
 #
 # Temperature scaling never changes which value is chosen or which label is predicted, only how confident the
 # method is -- so q_acc and macro-F1 are untouched; ECE, Brier, wrong-overwrite and coverage move.
+# v0.5: the entry temperature is fitted without the entries whose label is a coin flip by construction
+# (case["undecidable_ids"]), which score.py leaves out too. A method re-run after calibrate.py replaces its raw backup
+# (v0.4 kept the old backup and silently scaled stale predictions).
 
 import glob
 import json
@@ -18,7 +21,7 @@ import os
 import shutil
 from typing import Any, Dict, List, Tuple
 
-from recbench_common import LABELS, load_jsonl, match, norm_value, write_jsonl
+from recbench_common import KNOWN_SPLITS, LABELS, load_jsonl, match, norm_value, write_jsonl
 from score import ece as ece_score
 
 # ============================================================ settings
@@ -100,28 +103,45 @@ def pred_path(method: str, split: str) -> str:
     return "preds_%s_%s.jsonl" % (method, split)
 
 
+_RAW_DONE: set = set()
+
+
 def ensure_raw(method: str, split: str) -> str:
-    """Back up the untouched predictions once; always return the raw file path.
-    If the preds file has grown since the backup (a resumable run appended cases after calibrate.py ran), the new,
-    unscaled records are merged into the backup so nothing is lost."""
+    """Keep raw_preds_<method>_<split>.jsonl = the method's latest unscaled predictions; return its path.
+    A record without the "calibrated" key was written by the method after the last calibrate.py run, so it is newer
+    than the backup: if the whole preds file is unscaled (the method was re-run), it replaces the backup; if only some
+    records are (a resumable LLM run appended cases), they replace or extend the backup's records for those cases.
+    (v0.4 only appended new case ids, so a re-run of a method on a split it had already covered kept the stale backup.)"""
     rp, pp = raw_path(method, split), pred_path(method, split)
+    if (method, split) in _RAW_DONE:
+        return rp
+    _RAW_DONE.add((method, split))
     if not os.path.exists(rp):
         shutil.copyfile(pp, rp)
         return rp
     if os.path.exists(pp):
-        raw_ids = set(p["case_id"] for p in load_jsonl(rp))
-        extra = [p for p in load_jsonl(pp) if p["case_id"] not in raw_ids and "calibrated" not in p]
-        if extra:
-            with open(rp, "a", encoding="utf-8") as f:
-                for p in extra:
-                    f.write(json.dumps(p, ensure_ascii=False) + "\n")
-            print("  %s/%s: merged %d new cases into the raw backup" % (method, split, len(extra)))
+        preds = load_jsonl(pp)
+        fresh = [p for p in preds if "calibrated" not in p]
+        if fresh and len(fresh) == len(preds):
+            shutil.copyfile(pp, rp)
+            print("  %s/%s: the method was re-run; its new predictions replace the raw backup" % (method, split))
+        elif fresh:
+            raw = load_jsonl(rp)
+            pos = {p["case_id"]: i for i, p in enumerate(raw)}
+            for p in fresh:
+                if p["case_id"] in pos:
+                    raw[pos[p["case_id"]]] = p
+                else:
+                    pos[p["case_id"]] = len(raw)
+                    raw.append(p)
+            write_jsonl(rp, raw)
+            print("  %s/%s: %d new or re-run cases merged into the raw backup" % (method, split, len(fresh)))
     return rp
 
 
 def known_splits() -> List[str]:
-    """Every split with a cases file, longest name first (so book_subset is matched before book)."""
-    names = [os.path.basename(p)[len("cases_"):-len(".jsonl")] for p in glob.glob("cases_*.jsonl")]
+    """Every split name (a cases file present, or one the scripts write), longest first (book_subset before book)."""
+    names = [os.path.basename(p)[len("cases_"):-len(".jsonl")] for p in glob.glob("cases_*.jsonl")] + KNOWN_SPLITS
     return sorted(set(names), key=lambda s: -len(s))
 
 
@@ -182,7 +202,10 @@ def entry_pairs(cases: List[Dict[str, Any]], preds: List[Dict[str, Any]]) -> Tup
         p = pmap.get(c["case_id"])
         if not p:
             continue
+        coin = set(c.get("undecidable_ids") or [])     # labels decided by a coin flip: left out, as in score.py
         for a in c["assertions"]:
+            if a["id"] in coin:
+                continue
             item = p["assertions"].get(str(a["id"]))
             if not item:
                 continue
@@ -251,7 +274,7 @@ def main() -> None:
                 e0, e1 = ece_score(p0, y0), ece_score(p1, y1)
                 w0, w1 = wrong_ow(p0, y0), wrong_ow(p1, y1)
                 report[m]["splits"][split] = {"ece_before": e0, "ece_after": e1, "wrong_ow_before": w0, "wrong_ow_after": w1}
-                line += " %s %s/%s->%s/%s" % (split[:5], fmt(e0), fmt(w0), fmt(e1), fmt(w1))
+                line += "%s%s %s/%s->%s/%s" % (" " if line.endswith("|") else " | ", split, fmt(e0), fmt(w0), fmt(e1), fmt(w1))
         print(line)
     with open(OUT_JSON, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=1)

@@ -1,5 +1,16 @@
-# recbench_common.py -- shared helpers for the record-reconciliation benchmark (v0.4)
+# recbench_common.py -- shared helpers for the record-reconciliation benchmark (v0.5)
 # Python 3.9, stdlib only. Imported by gen.py, baselines.py, tune.py, calibrate.py, score.py, llm_baseline.py.
+#
+# v0.5 (candidate values; applies to every method that groups readings into clusters):
+#   - cluster_answer(): the value a method states for a chosen cluster is the mean of the cluster's readings from its
+#     most recent observed day (v0.4: the mean of all readings, old and new -- a chained weight cluster could span 11%
+#     on a 4% tolerance, so its mean could be wrong while its newest reading was right). For same-day data (snapshot
+#     regime, public sets) this is the plain cluster mean, exactly as before.
+#   - cluster() itself is unchanged. (A no-chaining variant was built and dropped before any run: on val it split the
+#     votes of a drifting weight across clusters -- majority vote's weight accuracy fell from 79.7% to 76.2% -- and
+#     made 48% of weight queries have two or more correct candidates, for +0.2 points of attainable weight accuracy.)
+#   - shown_round(): the one rounding rule for displayed weights (gen.py), so no generating process has its own
+#     number of decimals.
 
 import json
 from typing import Any, Dict, List, Optional, Tuple
@@ -27,6 +38,12 @@ LB_PER_KG = 2.20462
 LABELS = ["valid", "superseded", "erroneous"]
 
 SOURCES = ["owner", "vet_pdf", "extractor", "email_forward", "note_text"]
+
+# every split name the scripts write; score.py / calibrate.py match preds_<method>_<split>.jsonl to the longest of
+# these (plus any cases_*.jsonl present), so a prediction file is never misfiled when its cases file is absent
+KNOWN_SPLITS = ["train", "val", "heldout", "hard", "snapshot", "test_hard", "test_heldout", "test_snapshot",
+                "stock", "stock_nogold", "flight", "flight_dev", "flight_test", "flight_dev_nogold", "flight_test_nogold",
+                "book", "book_subset"]
 
 # ---------------------------------------------------------------- generic (real-data) fields
 # Real-data cases (realdata_map.py) carry their own field definitions:
@@ -94,7 +111,8 @@ def match(field: str, a: Any, b: Any) -> bool:
 
 def cluster(field: str, items: List[Tuple[Any, Any]]) -> List[Dict[str, Any]]:
     """Group (key, normalized_value) pairs into clusters of matching values.
-    Returns [{"value": representative, "members": [key, ...]}, ...]."""
+    Returns [{"value": representative (mean), "members": [key, ...]}, ...].
+    Methods state cluster_answer(...) for a chosen cluster, not "value" (v0.5, see the header)."""
     clusters: List[Dict[str, Any]] = []
     if is_categorical(field):
         index: Dict[str, int] = {}
@@ -104,7 +122,7 @@ def cluster(field: str, items: List[Tuple[Any, Any]]) -> List[Dict[str, Any]]:
                 clusters.append({"value": v, "members": []})
             clusters[index[v]]["members"].append(key)
         return clusters
-    # numeric: greedy, sorted by value, representative = running mean
+    # numeric (unchanged since v0.1): greedy, sorted by value, representative = running mean
     for key, v in sorted(items, key=lambda kv: kv[1]):
         placed = False
         for c in clusters:
@@ -117,6 +135,27 @@ def cluster(field: str, items: List[Tuple[Any, Any]]) -> List[Dict[str, Any]]:
         if not placed:
             clusters.append({"value": v, "members": [key]})
     return clusters
+
+
+def cluster_answer(field: str, members: List[Dict[str, Any]]) -> Any:
+    """The value a method states when it picks a cluster (v0.5): the mean of the normalized values of the cluster's
+    readings from their most recent observed day. `members` are the cluster's assertion dicts. Categorical clusters
+    hold one value. For same-day data (every reading on one day) this equals the plain cluster mean."""
+    if not members:
+        return None
+    if is_categorical(field):
+        a = members[0]
+        return norm_value(field, a["value"], a.get("unit"))
+    top = max(a["observed_day"] for a in members)
+    vals = [norm_value(field, a["value"], a.get("unit")) for a in members if a["observed_day"] == top]
+    return sum(vals) / len(vals)
+
+
+def shown_round(x: float) -> float:
+    """The one rounding rule for a displayed weight (in the unit it is shown in): 2 decimals below 10, 1 below 100,
+    else 0. v0.5: used by every generating process, so the number of decimals carries no information."""
+    decimals = 2 if x < 10 else (1 if x < 100 else 0)
+    return round(x, decimals)
 
 
 # ---------------------------------------------------------------- IO

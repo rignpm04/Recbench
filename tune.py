@@ -1,14 +1,19 @@
-# tune.py -- equal-budget hyperparameter search for the classical baselines (recbench v0.4)
+# tune.py -- equal-budget hyperparameter search for the classical baselines (recbench v0.5; the search is unchanged
+# since v0.4 -- the v0.5 val split is 600 cases, and the voting methods now state cluster_answer(), see baselines.py.
+# v0.5: tuned_params.json is updated, not overwritten: the feature model's entry (feature_baseline.py) is kept, so
+# re-running this script after the feature model never makes its seed-2/3 replicates re-tune.)
 # Run from PyCharm after gen.py. Reads cases_val.jsonl ONLY (the tuning split: train settings, separate seed),
 # writes tuned_params.json, which baselines.py applies to every split. Python 3.9, stdlib only.
 #
 # Protocol: every tunable method gets at most BUDGET configurations, chosen on val by query accuracy (ties: lower
 # Brier). Nothing from heldout / hard / snapshot / the real sets is ever read here. Methods with no
 # hyperparameters (newest_*, majority_vote) are listed as such. The reconciler and feature model are tuned under
-# the same budget inside their own scripts (feature_baseline.py TUNE, train_reconciler.py uses fixed v0 settings).
+# the same budget inside their own scripts (feature_baseline.py TUNE; train_reconciler.py uses fixed settings, its
+# v0.5 answer head chosen on val between two versions -- PREDICTIONS.md, v0.5 honesty note).
 
 import itertools
 import json
+import os
 import random
 import time
 from typing import Any, Dict, List, Tuple
@@ -111,8 +116,15 @@ def main() -> None:
                  for k, v in cfg.items()}
         print("%-18s %7.1f%% %7.1f%% %8d   %s" % (method, 100 * base_acc, 100 * acc, len(grid), shown))
     B.set_params(defaults)
+    rec: Dict[str, Any] = {}
+    if os.path.exists(OUT_FILE):                       # keep entries written by other scripts (feat_hgb)
+        with open(OUT_FILE, "r", encoding="utf-8") as f:
+            rec = json.load(f)
+    for method in B.METHODS:                           # this script's own entries are replaced as a whole
+        rec.pop(method, None)
+    rec.update(result)
     with open(OUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=1)
+        json.dump(rec, f, indent=1)
     print("\nwrote %s in %.0fs. Now run baselines.py (it applies these), then score.py." % (OUT_FILE, time.time() - t0))
 
 

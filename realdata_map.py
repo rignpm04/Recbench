@@ -1,4 +1,19 @@
-# realdata_map.py -- map the public truth-discovery datasets into recbench cases (v0.2)
+# realdata_map.py -- map the public truth-discovery datasets into recbench cases (v0.5)
+#
+# v0.5 changes (pre-registered in PREDICTIONS.md before any method was re-run; they apply to every method):
+#   - gate values with no digit ("Terminal") are placeholders, not gates -> null (they produced phantom ties)
+#   - assertions are shuffled within each case with a fixed seed, as the generator does, so file order carries no
+#     information (majority's tie-break was "first-listed source", which in Flight is the airline itself)
+#   - Flight is written as two splits by day: cases_flight_dev.jsonl (days <= FLIGHT_DEV_LAST_DAY, the days
+#     flight_diag.py read) and cases_flight_test.jsonl (later days, never inspected)
+#   - "nogold" variants (audit, Oct 9): in Flight the gold standard is the data of the three airline websites, which
+#     are also 3 of the 38 input sources; in Stock the gold comes from sites that are also inputs (Li et al., VLDB
+#     2012). cases_flight_dev_nogold / cases_flight_test_nogold / cases_stock_nogold.jsonl are the same cases with
+#     the gold-providing sources removed (GOLD_SOURCES below), so every method is also scored without an oracle vote.
+#     The script prints which sources it removed; check them against the source list it prints.
+#   - prints the largest record per dataset (the reconciler reads up to EVAL_MAX_ENTRIES entries per record)
+#   - each numeric query carries its tolerance in words ("1% relative", "10 minutes"), as generated queries do, so an
+#     LLM prompt states the right grading rule (v0.4 queries had none, so a prompt would have said "exact text")
 #
 # Datasets (Xin Luna Dong et al., https://www.lunadong.com/fusionDataSets.htm), download into DATA_DIR:
 #   Stock : clean_stock.zip  + nasdaq_truth.zip (or pop_truth.zip)      55 sources, 1000 symbols, July 2011, 1 file/day
@@ -23,6 +38,7 @@
 import glob
 import io
 import os
+import random
 import re
 import zipfile
 from typing import Any, Dict, List, Optional, Tuple
@@ -33,6 +49,14 @@ from recbench_common import match, norm_value, register_field_types, write_jsonl
 DATA_DIR = "realdata"            # folder next to this script holding the downloaded zips / txt files
 INSPECT = False                  # True the first time: list files + samples + guessed roles, write nothing.
 OUT_FILES = {"stock": "cases_stock.jsonl", "flight": "cases_flight.jsonl", "book": "cases_book.jsonl"}
+FLIGHT_DEV_LAST_DAY = "2011-12-15"   # Flight days <= this -> cases_flight_dev.jsonl; later -> cases_flight_test.jsonl
+FLIGHT_FILES = {"dev": "cases_flight_dev.jsonl", "test": "cases_flight_test.jsonl"}
+SHUFFLE_ASSERTIONS = True            # seeded per-case shuffle of assertion order (v0.5); False = file order (v0.4)
+# gold-providing sources, matched on the source name lowercased with everything but letters and digits removed:
+#   "exact" = the whole name, "prefix" = the start of the name. Flight: the three airline sites (named aa / ua / CO in
+#   the Oct 2026 download). Stock: nasdaq.com supplies the nasdaq truth file used here (STOCK_TRUTH_PREFER).
+GOLD_SOURCES = {"flight": ("exact", ["aa", "ua", "co"]), "stock": ("prefix", ["nasdaq"])}
+WRITE_NOGOLD = True
 
 STOCK_TRUTH_PREFER = "nasdaq"    # "nasdaq" (nasdaq.com values) or "pop" (majority of 5 providers)
 STOCK_TOL_REL = 0.01             # two stock values are the same fact if within 1% (relative)
@@ -166,7 +190,11 @@ def parse_time(s: str) -> Optional[float]:
 def norm_gate(s: str) -> Optional[str]:
     t = re.sub(r"\s+", "", s.strip().upper())
     t = t.replace("GATE", "")
-    return None if t.lower() in NULLS or not t else t
+    if t.lower() in NULLS or not t:
+        return None
+    if not re.search(r"\d", t):          # v0.5: "Terminal", "TBD", ... are placeholders, not gates
+        return None
+    return t
 
 
 def norm_isbn(s: str) -> str:
@@ -325,6 +353,17 @@ for _a in FLIGHT_ATTRS:
 FIELD_TYPES["book.authors"] = ["cat", None]
 
 
+def tolerance_text(field: str) -> Optional[str]:
+    """The grading tolerance in words, stored on each query as the generator does (v0.5; the LLM prompt and the Hub
+    environment show it). None = exact match."""
+    t, tol = FIELD_TYPES[field]
+    if t == "num_rel":
+        return "%g%% relative" % (tol * 100)
+    if t == "num_abs":
+        return "%g minutes (times are minutes of the day)" % tol if field.startswith("flight.") else "%g absolute" % tol
+    return None
+
+
 # ============================================================ case assembly
 def make_cases(dataset: str, day: Optional[str], data: Dict[str, List[Tuple[str, Dict[str, Any]]]],
                truth: Dict[str, List[Tuple[str, Dict[str, Any]]]], subset_mode: bool = False) -> List[Dict[str, Any]]:
@@ -364,12 +403,59 @@ def make_cases(dataset: str, day: Optional[str], data: Dict[str, List[Tuple[str,
                 })
         if not assertions:
             continue
+        if SHUFFLE_ASSERTIONS:            # v0.5: file order is not information; the generator shuffles too
+            random.Random("%d|%s" % (SAMPLE_SEED, case["case_id"])).shuffle(assertions)
+            for i, a in enumerate(assertions):
+                a["id"] = i
         case["assertions"] = assertions
         fields_with = set(a["field"] for a in assertions)
-        case["queries"] = [{"field": f, "answer": truth_vals[f], "answer_type": FIELD_TYPES[f][0],
-                            "decidable": True} for f in truth_vals if f in fields_with]
+        case["queries"] = [dict({"field": f, "answer": truth_vals[f], "answer_type": FIELD_TYPES[f][0], "decidable": True},
+                                **({"tolerance": tolerance_text(f)} if tolerance_text(f) else {}))
+                           for f in truth_vals if f in fields_with]
         cases.append(case)
     return cases
+
+
+# ============================================================ gold-source-removed variants (v0.5)
+def _norm_source(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def is_gold_source(dataset: str, source: str) -> bool:
+    mode, names = GOLD_SOURCES.get(dataset, ("exact", []))
+    n = _norm_source(source)
+    return (n in names) if mode == "exact" else any(n.startswith(x) for x in names)
+
+
+def without_gold(cases: List[Dict[str, Any]], dataset: str, new_split: str) -> List[Dict[str, Any]]:
+    """The same cases minus the gold-providing sources' assertions (ids renumbered in the shuffled order); a query
+    whose field has no assertion left is dropped, and so is a case with none left."""
+    out = []
+    for c in cases:
+        keep = [dict(a) for a in c["assertions"] if not is_gold_source(dataset, a["source"])]
+        if not keep:
+            continue
+        for i, a in enumerate(keep):
+            a["id"] = i
+        nc = dict(c)
+        nc["case_id"] = "%s-%s" % (new_split, c["case_id"].split("-", 1)[1])
+        nc["split"] = new_split
+        nc["assertions"] = keep
+        fields = set(a["field"] for a in keep)
+        nc["queries"] = [q for q in c["queries"] if q["field"] in fields]
+        out.append(nc)
+    return out
+
+
+def report_gold(dataset: str, cases: List[Dict[str, Any]]) -> None:
+    srcs = sorted(set(a["source"] for c in cases for a in c["assertions"]))
+    gold = [x for x in srcs if is_gold_source(dataset, x)]
+    print("  %s: %d sources: %s" % (dataset, len(srcs), ", ".join(srcs)))
+    if gold:
+        print("  %s: removed as gold-providing in the *_nogold files: %s" % (dataset, ", ".join(gold)))
+    else:
+        print("  %s: WARNING -- no source matched GOLD_SOURCES[%r]; the *_nogold files equal the originals. Fix "
+              "GOLD_SOURCES from the list above." % (dataset, dataset))
 
 
 # ============================================================ driver
@@ -429,13 +515,43 @@ def main() -> None:
         n_total = len(cases)
         cap = MAX_CASES.get(dataset)
         if cap and len(cases) > cap:
-            import random
             cases = random.Random(SAMPLE_SEED).sample(cases, cap)
             cases.sort(key=lambda c: c["case_id"])
         if not cases:
             print("%-6s no cases (no data/truth files matched; check roles with INSPECT = True)" % dataset)
             continue
+        if dataset == "flight":           # v0.5: two splits by day; the test days were never inspected
+            parts = {"dev": [], "test": []}
+            for c in cases:
+                day = c["case_id"].split("-", 1)[1][:10]
+                parts["dev" if day <= FLIGHT_DEV_LAST_DAY else "test"].append(c)
+            for part, sub in parts.items():
+                for c in sub:
+                    c["split"] = "flight_" + part
+                    c["case_id"] = "flight_%s-%s" % (part, c["case_id"].split("-", 1)[1])
+                write_jsonl(FLIGHT_FILES[part], sub)
+                if WRITE_NOGOLD:
+                    ng = without_gold(sub, "flight", "flight_%s_nogold" % part)
+                    write_jsonl("cases_flight_%s_nogold.jsonl" % part, ng)
+                    print("flight_%-4s nogold: %d cases, %d assertions -> cases_flight_%s_nogold.jsonl" % (
+                        part, len(ng), sum(len(c["assertions"]) for c in ng), part))
+                n_a = sum(len(c["assertions"]) for c in sub)
+                n_e = sum(1 for c in sub for a in c["assertions"] if a["label"] == "erroneous")
+                print("flight_%-4s %5d cases | %6d assertions | erroneous %.1f%% | days %s -> %s" % (
+                    part, len(sub), n_a, 100.0 * n_e / max(1, n_a),
+                    ("<= " if part == "dev" else "> ") + FLIGHT_DEV_LAST_DAY, FLIGHT_FILES[part]))
+            report_gold("flight", cases)
+            print("  flight: largest record %d assertions" % max(len(c["assertions"]) for c in cases))
+            if os.path.exists(OUT_FILES["flight"]):
+                print("note: %s is the v0.4 all-days file; delete it so it is not scored as a third Flight split" % OUT_FILES["flight"])
+            continue
         write_jsonl(OUT_FILES[dataset], cases)
+        if dataset == "stock" and WRITE_NOGOLD:
+            report_gold("stock", cases)
+            ng = without_gold(cases, "stock", "stock_nogold")
+            write_jsonl("cases_stock_nogold.jsonl", ng)
+            print("stock  nogold: %d cases, %d assertions -> cases_stock_nogold.jsonl" % (
+                len(ng), sum(len(c["assertions"]) for c in ng)))
         if subset_cases:
             write_jsonl(BOOK_SUBSET_FILE, subset_cases)
             n_sub_err = sum(1 for c in subset_cases for a in c["assertions"] if a["label"] == "erroneous")
@@ -443,12 +559,13 @@ def main() -> None:
             print("%-6s %5d cases, subset mode | erroneous %.1f%% -> %s" % ("book", len(subset_cases),
                   100.0 * n_sub_err / max(1, n_sub), BOOK_SUBSET_FILE))
         n_assert = sum(len(c["assertions"]) for c in cases)
+        print("  %s: largest record %d assertions" % (dataset, max(len(c["assertions"]) for c in cases)))
         n_err = sum(1 for c in cases for a in c["assertions"] if a["label"] == "erroneous")
         n_src = len(set(a["source"] for c in cases for a in c["assertions"]))
         print("%-6s %5d cases (of %d) | %6d assertions (%.1f/case) | %d sources | erroneous %.1f%% | days %d -> %s"
               % (dataset, len(cases), n_total, n_assert, n_assert / len(cases), n_src,
                  100.0 * n_err / max(1, n_assert), len(truth_by_day), OUT_FILES[dataset]))
-    print("now run baselines.py, then score.py (both pick up cases_stock/flight/book.jsonl automatically)")
+    print("now run baselines.py, then score.py (both pick up cases_stock/flight_dev/flight_test/book.jsonl automatically)")
 
 
 if __name__ == "__main__":

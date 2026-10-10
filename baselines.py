@@ -1,6 +1,11 @@
-# baselines.py -- rule and truth-discovery baselines for recbench v0.4
+# baselines.py -- rule and truth-discovery baselines for recbench v0.5
 # Run from PyCharm after gen.py (and after tune.py, if you want the tuned settings).
 # Reads cases_*.jsonl, writes preds_<method>_<split>.jsonl. Python 3.9, stdlib only.
+#
+# v0.5: the voting / truth-discovery methods state cluster_answer() for the cluster they pick (the mean of its most
+# recent readings) instead of the mean of all its readings, so a weight answer is no longer an average of old and new
+# weights (a weight cluster chains across a drift). Cluster membership, and so every vote, is unchanged. Same-day data
+# (snapshot, public sets): unchanged. The three rules already state one reading's value.
 #
 # Hyperparameters live in PARAMS. If tuned_params.json exists (written by tune.py from the `val` split) and
 # USE_TUNED is True, the tuned values replace the defaults -- same method names, so the paper tables are the tuned
@@ -12,7 +17,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from recbench_common import FIELDS, cluster, load_jsonl, match, norm_value, write_jsonl
+from recbench_common import FIELDS, cluster, cluster_answer, load_jsonl, match, norm_value, write_jsonl
 
 # ============================================================ settings
 SPLITS = {"train": "cases_train.jsonl", "val": "cases_val.jsonl", "heldout": "cases_heldout.jsonl",
@@ -55,6 +60,12 @@ def load_tuned() -> Dict[str, Any]:
 # ============================================================ shared
 def nv(a: Dict[str, Any]) -> Any:
     return norm_value(a["field"], a["value"], a.get("unit"))
+
+
+def answer_of(field: str, A: List[Dict[str, Any]], c: Dict[str, Any]) -> Any:
+    """The value stated for a chosen cluster (v0.5): the mean of its most recent readings (cluster_answer)."""
+    ids = set(c["members"])
+    return cluster_answer(field, [a for a in A if a["id"] in ids])
 
 
 def assign_labels(field: str, A: List[Dict[str, Any]], chosen: Any, chosen_conf: float,
@@ -115,7 +126,7 @@ def m_majority_vote(field: str, A: List[Dict[str, Any]], now: int) -> Tuple[Any,
     for c in cl:
         for mid in c["members"]:
             claim[mid] = len(c["members"]) / float(len(A))
-    return best["value"], conf, claim
+    return answer_of(field, A, best), conf, claim
 
 
 def m_time_decayed_vote(field: str, A: List[Dict[str, Any]], now: int) -> Tuple[Any, float, Dict[int, float]]:
@@ -134,7 +145,7 @@ def m_time_decayed_vote(field: str, A: List[Dict[str, Any]], now: int) -> Tuple[
         share = sum(w[m] for m in c["members"]) / total
         for m in c["members"]:
             claim[m] = share
-    return best["value"], conf, claim
+    return answer_of(field, A, best), conf, claim
 
 
 # ============================================================ truth discovery
@@ -192,7 +203,7 @@ def m_dawid_skene(field: str, A: List[Dict[str, Any]], now: int) -> Tuple[Any, f
     for k, (clk, claimsk) in structured.items():
         for s, ci, _id in claimsk:
             claim_conf[_id] = post[k][ci]
-    return cl[best]["value"], p[best], claim_conf
+    return answer_of(field, A, cl[best]), p[best], claim_conf
 
 
 def m_truthfinder(field: str, A: List[Dict[str, Any]], now: int) -> Tuple[Any, float, Dict[int, float]]:
@@ -246,7 +257,7 @@ def m_truthfinder(field: str, A: List[Dict[str, Any]], now: int) -> Tuple[Any, f
         for ci, c in enumerate(clk):
             for m in c["members"]:
                 claim_conf[m] = conf[k][ci] / tot
-    return cl[best]["value"], cf[best] / total, claim_conf
+    return answer_of(field, A, cl[best]), cf[best] / total, claim_conf
 
 
 METHOD_FN = {
@@ -290,7 +301,7 @@ def main() -> None:
     tuned = load_tuned()
     defaults = json.loads(json.dumps(PARAMS))
     if tuned:
-        print("using tuned parameters from %s for: %s" % (TUNED_FILE, ", ".join(sorted(tuned))))
+        print("using tuned parameters from %s for: %s" % (TUNED_FILE, ", ".join(sorted(m for m in tuned if m in METHODS))))
     else:
         print("no %s found (run tune.py first) -- using default parameters" % TUNED_FILE)
     for split, path in all_splits().items():

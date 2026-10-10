@@ -1,4 +1,5 @@
-# llm_costs.py -- exact token / cost / coverage accounting for the LLM runs (recbench v0.4)
+# llm_costs.py -- exact token / cost / coverage accounting for the LLM runs (recbench v0.5)
+# v0.5: prices per provider tag (llm_deepseek* / llm_claude*); copy the same numbers you put in llm_baseline.py.
 # Run from PyCharm after llm_baseline.py. Reads replies_llm_*.jsonl (one line per API reply, written by
 # llm_baseline.py since v0.4: tokens from the API's usage field) and the matching preds files. Python 3.9, stdlib only.
 # Prints one row per (method, split): replies, cases, tokens in / out / cache-hit, estimated cost at the prices below,
@@ -9,8 +10,13 @@ import json
 import os
 from typing import Any, Dict, List
 
-PRICE_IN_PER_M = 0.15      # USD per 1M input tokens  (edit to your plan; DeepSeek bills cache hits lower)
-PRICE_OUT_PER_M = 0.60     # USD per 1M output tokens
+# USD per 1M (input, output) tokens by provider tag (DeepSeek bills cache hits lower; the console is the true cost)
+PRICES = {"deepseek": (0.15, 0.60), "claude": (0.0, 0.0)}
+
+
+def prices_for(method: str):
+    tag = method[len("llm_"):].split("_")[0] if method.startswith("llm_") else ""
+    return PRICES.get(tag, (0.0, 0.0))
 
 
 def load(path: str) -> List[Dict[str, Any]]:
@@ -49,7 +55,8 @@ def main() -> None:
             k = str(r.get("finish_reason"))
             finish[k] = finish.get(k, 0) + 1
         cases = set(r["case_id"] for r in replies)
-        cost = tin / 1e6 * PRICE_IN_PER_M + tout / 1e6 * PRICE_OUT_PER_M
+        p_in, p_out = prices_for(method)
+        cost = tin / 1e6 * p_in + tout / 1e6 * p_out
         # coverage from the (raw) preds file
         pred_path = "raw_preds_%s_%s.jsonl" % (method, split)
         if not os.path.exists(pred_path):
@@ -59,8 +66,10 @@ def main() -> None:
             preds = {p["case_id"]: p for p in load(pred_path)}
             qcount = {c["case_id"]: len(c["queries"]) for c in load("cases_%s.jsonl" % split)}
             for cid, p in preds.items():
+                if not qcount.get(cid, 0):
+                    continue                      # a case with nothing to ask (an empty record) is not a failure
                 n_pred += 1
-                n_q += qcount.get(cid, 0)
+                n_q += qcount[cid]
                 n_ans += len(p["queries"])
                 if not p["queries"]:
                     n_empty += 1
@@ -76,8 +85,8 @@ def main() -> None:
         tot_in += tin; tot_out += tout; tot_cost += cost
         cov = ("%d/%d cases no answers | %d/%d queries (%.1f%%)" % (n_empty, n_pred, n_ans, n_q, 100.0 * n_ans / n_q)) if n_q else "-"
         print("%-20s %-9s %7d %6d %11d %11d %9d %8.3f  %s | %s" % (m, s, nr, nc, tin, tout, tc, cost, finish, cov))
-    print("\ntotal: tokens in %d out %d | est. $%.2f at $%.2f/$%.2f per M (cache hits billed lower by DeepSeek; the console export is the true cost)" % (
-        tot_in, tot_out, tot_cost, PRICE_IN_PER_M, PRICE_OUT_PER_M))
+    print("\ntotal: tokens in %d out %d | est. $%.2f at the PRICES per provider (cache hits are billed lower; the provider's console is the true cost)" % (
+        tot_in, tot_out, tot_cost))
 
 
 if __name__ == "__main__":
