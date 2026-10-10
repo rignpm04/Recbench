@@ -44,7 +44,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 # ============================================================ settings
@@ -273,7 +273,7 @@ PARTY_RULES = [
     (r"\brespect\b", "respect"),
     (r"co ?operative|\blabour\b", "labour"),
     (r"conservative|\btory\b|\btories\b", "conservative"),
-    (r"\bindependent\b|non affiliated|no party", "independent"),
+    (r"\bindependents?\b|non affiliated|no party", "independent"),
     (r"\byour party\b", "yourparty"),
 ]
 
@@ -421,7 +421,16 @@ def infobox_params(text: str) -> Optional[Dict[str, str]]:
             continue
         k, v = p.split("=", 1)
         params[re.sub(r"[\s_]+", "_", k.strip().lower())] = v.strip()
+    if depth != 0:
+        params["__unclosed__"] = "1"      # the infobox never closes: its values cannot be trusted
     return params
+
+
+def balanced(v: str) -> bool:
+    """False when a value holds an unclosed [[ or {{ -- the edit broke the markup and the value swallowed the
+    parameters after it (seen in the probe: 'Lies | primeminister1 = ...')."""
+    v = clean_refs(v)
+    return v.count("[[") == v.count("]]") and v.count("{{") == v.count("}}")
 
 
 MONTHS = {m: i for i, m in enumerate(["january", "february", "march", "april", "may", "june", "july", "august",
@@ -461,7 +470,13 @@ _MP_OFFICE = re.compile(r"member of parliament\b|^\s*mp\b", re.I)
 def wp_values(params: Dict[str, str]) -> Dict[str, Any]:
     """Party, current constituency and its majority from one infobox. 'none' = every MP seat listed has ended."""
     out: Dict[str, Any] = {"party": None, "constituency": None, "majority": None, "_raw": {}}
+    if params.get("__unclosed__"):
+        STATS["enwiki_revisions_broken_markup"] += 1
+        return out
     raw = params.get("party")
+    if raw is not None and not balanced(raw):
+        STATS["enwiki_values_broken_markup"] += 1
+        raw = None
     if raw is not None:
         pre = unwrap_templates(clean_refs(raw))
         cands = []
@@ -484,28 +499,40 @@ def wp_values(params: Dict[str, str]) -> Dict[str, Any]:
                 out["party"] = key
                 out["_raw"]["party"] = pick[0][:80]
     entries = []
+    broken = False
     for k, v in params.items():
         m = re.match(r"^(office|constituency_mp)(\d*)$", k)
         if not m:
             continue
-        txt = strip_markup(v).replace("\n", " ").strip()
+        lines_txt = strip_markup(v)
+        txt = lines_txt.replace("\n", " ").strip()
         if not txt:
             continue
         kind, idx = m.groups()
+        if kind == "office" and not _MP_OFFICE.search(txt):
+            continue
+        if not balanced(v):
+            broken = True
+            continue
         if kind == "office":
-            if not _MP_OFFICE.search(txt):
+            # "Member of Parliament / for Rayleigh and Wickford / Rayleigh (2001-2010)": the seat is the first line
+            # after "for"; further lines name earlier seats
+            mm = re.search(r"\bfor\b\s*(.*)$", lines_txt, re.I | re.S)
+            rest = [x.strip() for x in (mm.group(1) if mm else "").split("\n") if x.strip()]
+            if not rest:
                 continue
-            mm = re.search(r"\bfor\b\s+(.+)$", txt, re.I)
-            if not mm:
-                continue
-            cons = mm.group(1).strip()
+            cons = rest[0]
         else:
-            cons = txt
+            rest = [x.strip() for x in lines_txt.split("\n") if x.strip()]
+            cons = rest[0]
         te_raw = clean_refs(params.get("term_end" + idx) or params.get("termend" + idx) or "").strip()
         te = strip_markup(te_raw) or te_raw          # {{end date|...}} strips to nothing but is still an end date
         ended = bool(te_raw) and not re.match(r"^(present|incumbent|current|-|\u2013|\u2014)?$", te.strip(), re.I)
         ts = wp_date(params.get("term_start" + idx) or params.get("termstart" + idx) or "")
         entries.append((cons, ended, ts, params.get("majority" + idx)))
+    if broken:
+        STATS["enwiki_values_broken_markup"] += 1
+        entries = []                      # a seat value swallowed other parameters: no seat or majority this revision
     if entries:
         cur = [e for e in entries if not e[1]]
         if not cur:
@@ -628,7 +655,7 @@ def statement_info(st: Any) -> Optional[dict]:
             "districts": [v for v in qv("P768") if isinstance(v, str)],
             "groups": [v for v in qv("P4100") if isinstance(v, str)],
             "ref_pids": sorted(ref_pids), "ref_items": sorted(ref_items), "ref_urls": ref_urls[:5],
-            "wiki_import": wiki}
+            "wiki_import": wiki, "has_refs": bool(ref_pids)}
 
 
 def wd_extract(content: Optional[str]) -> Optional[List[dict]]:
@@ -1095,6 +1122,7 @@ def to_entries(mid: int, source: str, timeline: List[Tuple[int, dict, Any, bool]
                     used = vals["_used"].get(f) or []
                     e["cites_parliament"] = any(is_parl_ref(s, LABELS_CACHE) for s in used)
                     e["cites_wikipedia"] = any(s["wiki_import"] for s in used)
+                    e["cites_anything"] = any(s.get("has_refs") for s in used)
                     if f == "party":
                         e["path"] = vals.get("_party_path")
                 out.append(e)
@@ -1352,15 +1380,33 @@ def main() -> None:
     if entries and len(copied) / len(entries) < GO_MAX_MACHINE_COPIED <= (len(copied) + len(cites_snap)) / len(entries):
         print("  NOTE: counting every snapshot entry that cites Parliament as copied would cross the threshold -- the"
               " copy check is inconclusive; who added those statements needs a look.")
+    prov = Counter()
+    for e in wd_all:
+        who = "snapshot (setter unknown)" if e["automated"] is None else ("bot/tool" if e["automated"] else "person")
+        what = "cites Parliament" if e.get("cites_parliament") else ("cites something else" if e.get("cites_anything")
+                                                                     else "no reference")
+        prov[(who, what)] += 1
+    print("  Wikidata entries by who made them x what they cite:")
+    for who in ("bot/tool", "person", "snapshot (setter unknown)"):
+        print("    %-26s %s" % (who + ":", ", ".join("%s %d" % (w, prov[(who, w)]) for w in
+                                                    ("cites Parliament", "cites something else", "no reference"))))
+    bots = Counter(e.get("user") or "?" for e in wd_all if e["automated"])
+    if bots:
+        print("  bot/tool editors behind Wikidata entries: %s" % ", ".join("%s %d" % kv for kv in bots.most_common(6)))
 
     print("\nPARSING CHECKS")
-    never = Counter((e["source"], e["field"], str(e["value"])) for e in entries if not e["in_answer_key"])
-    example = {}
-    for e in entries:
-        example.setdefault((e["source"], e["field"], str(e["value"])), e.get("raw"))
-    print("  values that never appear in the member's answer key (normalization or genuine errors), top 20:")
-    for (s, f, v), c in never.most_common(20):
-        print("    %4d  %-9s %-13s %-28s e.g. %s" % (c, s, f, v[:28], (example.get((s, f, v)) or "")[:60]))
+    never = [e for e in entries if not e["in_answer_key"]]
+    print("  entries whose value never appears in the member's answer key: %d ('not an MP' %d, majority %d, other %d)"
+          % (len(never), sum(1 for e in never if e["value"] == "none"), sum(1 for e in never if e["field"] == "majority"),
+             sum(1 for e in never if e["value"] != "none" and e["field"] != "majority")))
+    gold_of = {m["mid"]: m["gold"] for m in sample}
+    shown = [e for e in never if e["value"] != "none"]
+    shown.sort(key=lambda e: (e["field"] == "majority", e["field"], e["member"], e["time"]))
+    print("  the party/constituency ones, then majority (member, source, date: value -> Parliament then), up to 30:")
+    for e in shown[:30]:
+        print("    %5d %-8s %s %-12s %-34s -> %s [%s]" % (
+            e["member"], e["source"], e["time"][:10], e["field"], str(e.get("raw") or e["value"])[:34],
+            str(gold_of[e["member"]].at(e["field"], e["t"]))[:30], e["label"]))
     if wd_unmatched_p39:
         print("  Wikidata positions with an electoral district not counted as Commons seats (latest revision):")
         for k, c in wd_unmatched_p39.most_common(8):
@@ -1376,6 +1422,45 @@ def main() -> None:
             print("    %4d  %s" % (c, k))
     if STATS.get("enwiki_party_several_lines"):
         print("  Wikipedia party fields with several lines: %d revisions" % STATS["enwiki_party_several_lines"])
+
+    print("\nSENSITIVITY (not part of the verdict)")
+    keep = [e for e in entries if e["value"] != "none"]
+    print("  without 'not an MP' entries: superseded per member %.2f, erroneous %d, can't tell %d" % (
+        sum(1 for e in keep if e["label"] == "superseded") / n if n else 0.0,
+        sum(1 for e in keep if e["label"] == "erroneous"), sum(1 for e in keep if e["label"] == CANT)))
+    by_era = {k: [m for m in sample if era(day_of(m["start"])) == k] for k in keys}
+    if f_era and all(by_era[k] for k in keys if f_era[k]):
+        fw = {k: f_era[k] / sum(f_era.values()) for k in keys}
+        def wavg(fn):                       # frame-weighted mean over members of a per-member quantity
+            return sum(fw[k] * sum(fn(m) for m in by_era[k]) / len(by_era[k]) for k in keys if by_era[k])
+        mine = defaultdict(list)
+        for e in entries:
+            mine[e["member"]].append(e)
+        w_two = {f: wavg(lambda m, f=f: float(all(any(e["source"] == s2 and e["field"] == f for e in mine[m["mid"]])
+                                                    for s2 in SOURCES))) for f in ("party", "constituency")}
+        w_sup = wavg(lambda m: sum(1 for e in mine[m["mid"]] if e["label"] == "superseded"))
+        w_err = n * wavg(lambda m: sum(1 for e in mine[m["mid"]] if e["label"] == "erroneous"))
+        w_cop = wavg(lambda m: sum(1 for e in mine[m["mid"]] if e["source"] == "wikidata" and e["automated"]
+                                   and e.get("cites_parliament"))) / max(1e-9, wavg(lambda m: len(mine[m["mid"]])))
+        print("  reweighted to the frame's mix of first years (%s):" % ", ".join("%s %.0f%%" % (k, 100 * fw[k])
+                                                                                for k in keys))
+        print("    1. both sources: party %.0f%%, constituency %.0f%%  2. superseded per member %.2f  3. erroneous"
+              " %.0f  4. machine-copied %.0f%%" % (100 * w_two["party"], 100 * w_two["constituency"], w_sup, w_err,
+                                                  100 * w_cop))
+        w_ok = (min(w_two.values()) >= GO_TWO_SOURCES_SHARE and w_sup >= GO_SUPERSEDED_PER_MEMBER and
+                w_err >= GO_MIN_ERRONEOUS and w_cop < GO_MAX_MACHINE_COPIED)
+        print("    reweighted verdict: %s" % ("GO" if w_ok else "NO-GO"))
+        for k in keys:
+            ms = by_era[k]
+            if not ms:
+                print("    first year %-13s  0 members" % k)
+                continue
+            print("    first year %-13s %2d members: entries/member %.1f, superseded/member %.2f, erroneous/member %.2f"
+                  % (k, len(ms), sum(len(mine[m["mid"]]) for m in ms) / len(ms),
+                     sum(1 for m in ms for e in mine[m["mid"]] if e["label"] == "superseded") / len(ms),
+                     sum(1 for m in ms for e in mine[m["mid"]] if e["label"] == "erroneous") / len(ms)))
+    else:
+        print("  reweighting not possible (a first-year group of the frame has no sampled member)")
 
     print("\nGO / NO-GO (thresholds fixed before the first run)")
     two = {}
