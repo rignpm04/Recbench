@@ -7,3 +7,6 @@ realdata/
 raw_preds_*.jsonl
 reconciler_permuted.pt
 replies_*.jsonl
+*.pkl
+reconciler_seed*.pt
+reconciler_permuted_cross.pt
