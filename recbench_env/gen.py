@@ -1,9 +1,40 @@
-# gen.py -- synthetic longitudinal pet-record generator (recbench v0.4, generator v2)
-# Run from PyCharm. Writes cases_train / cases_val / cases_heldout / cases_hard / cases_snapshot .jsonl into this folder.
-# Python 3.9, stdlib only.
+# gen.py -- synthetic longitudinal pet-record generator (recbench v0.5, generator v3)
+# Run from PyCharm. Writes cases_train / cases_val / cases_heldout / cases_hard / cases_snapshot .jsonl into this folder
+# (and, once, at the very end of v0.5, the sealed test splits -- see MAKE_TEST_SPLITS). Python 3.9, stdlib only.
+#
+# Generator v3, second set of changes (v0.5 audit, Oct 9; none of them uses the public sets):
+#   - one rounding rule for every displayed weight (recbench_common.shown_round). v2 rounded contamination and genuine
+#     owner corrections to 2 decimals and everything else to 0-2 by size, so "2 decimals on a weight >= 10" identified
+#     those two processes to anything reading the raw text. Changes only the last digit of those entries.
+#   - case["undecidable_ids"]: every entry whose label is decided by the coin flip of an undecidable same-day pair --
+#     the pair itself and any earlier reading of either pair value that was right when observed (valid if the coin
+#     chose its value, superseded otherwise). Found by re-labelling the field with the other outcome. score.py and
+#     calibrate.py leave them out of the per-entry metrics. Not an input: no method reads it.
+#   - OCR digit errors keep the reading's decimals beyond the first (v2 rebuilt the number from a one-decimal string,
+#     so an OCR'd weight below 10 showed one decimal where every other process shows two). Same digit change, same
+#     re-draw test, same RNG: only the trailing decimals of OCR'd readings change.
+#   - a counter for the internal _tmp_id (v2 reused len(assertions) after add_undecidable removed entries, so two
+#     entries could share one; no reference was ever corrupted -- checked on every split -- but the tie order of a few
+#     same-day entries can differ from v2)
+#   - snapshot regime: snap_exact_valid (range includes the v3-as-first-written behaviour, 0): the share of correct
+#     num_rel readings that state the true value exactly instead of a jittered value inside the tolerance. With
+#     exact copied errors and always-jittered correct values, "the most common exact value" was a copied error far
+#     more often than in real data (40% right vs 88% with the tolerance on v2 snapshot cases).
+#   - sealed test splits test_hard / test_heldout / test_snapshot (same settings as hard / heldout / snapshot, new
+#     seeds), generated ONCE after every method is frozen (MAKE_TEST_SPLITS); the v0.5 claims rest on them because
+#     hard and heldout have been studied in detail.
 #
 # A case = one entity, a hidden truth, and the stream of assertions the app would have seen.
 # Every assertion is labeled valid / superseded / erroneous against the hidden truth at "now".
+#
+# Generator v3 (v0.5), first set of changes: the snapshot regime, after flight_diag.py showed what the Flight set has
+# that v2 did not (see PREDICTIONS.md, v0.5 section). Every new knob is a range that includes the v2 behaviour:
+#   - feeds: sources can be members of a feed and show the feed's rows verbatim (snap_feeds, snap_feed_share)
+#   - field-specific reliability: per-emitter per-field accuracy, blended with the emitter mean by snap_field_corr
+#   - snap_copy upper bound 0.9 -> 1.0, so a field can have one wrong value shared by everyone who is wrong
+#   - new error_type "feed_error" for wrong values carried by a feed block (scored as its own conflict type)
+# The longitudinal regime (85% of train) changes only through the audit changes above (displayed decimals of some
+# weights, undecidable_ids, the tie order of a few same-day entries). v2 is preserved at the v0.4 release tag.
 #
 # Generator v2 (v0.4) adds, on top of v1:
 #   - a `val` split: same settings as train; used ONLY for tuning baselines and fitting temperature scaling
@@ -21,13 +52,20 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from recbench_common import (FIELDS, FIELD_TYPE, LB_PER_KG, TOL_WEIGHT_REL, TOL_BIRTH_DAYS, TOL_EVENT_DAYS,
-                             match, norm_value, register_field_types, truth_at, write_jsonl)
+                             match, norm_value, register_field_types, shown_round, truth_at, write_jsonl)
 
 # ============================================================ settings
 SEED = 20261001
-N_CASES = {"train": 2000, "val": 300, "heldout": 500, "hard": 200, "snapshot": 300}
-OUT_FILES = {s: "cases_%s.jsonl" % s for s in N_CASES}
-SPLIT_SEED = {"train": 1, "heldout": 2, "hard": 3, "val": 4, "snapshot": 5}   # added to SEED per split
+N_CASES = {"train": 2000, "val": 600, "heldout": 500, "hard": 200, "snapshot": 300}   # v0.5: val 300 -> 600 (tuning and
+# calibration were fitted on ~2,100 queries; the first 300 v3 val cases hold only 27 snapshot cases, 9% vs 15%)
+# Sealed test splits (v0.5): same settings as hard / heldout / snapshot, new seeds. Leave MAKE_TEST_SPLITS = False
+# until every method, setting and prediction for v0.5 is frozen and committed; then set it True, run once, and run
+# every method on them once. Generating them does not change any other split.
+MAKE_TEST_SPLITS = False
+TEST_SPLITS = {"test_hard": 1000, "test_heldout": 1000, "test_snapshot": 500}
+OUT_FILES = {s: "cases_%s.jsonl" % s for s in list(N_CASES) + list(TEST_SPLITS)}
+SPLIT_SEED = {"train": 1, "heldout": 2, "hard": 3, "val": 4, "snapshot": 5,
+              "test_hard": 6, "test_heldout": 7, "test_snapshot": 8}   # added to SEED per split
 START_DAY = -365          # truth exists from one year before the record starts (old vet records)
 
 # Knobs per split. "heldout" = different settings than train (shifted mixes, lags, rates).
@@ -47,7 +85,11 @@ _TRAIN = dict(
     # v2
     p_benign_note=0.30, p_redundant_correct=0.15,
     p_snapshot=0.15, snap_sources=(5, 40), snap_fields=(2, 6), snap_cover=(0.3, 1.0),
-    snap_mean_acc=(0.35, 0.95), snap_acc_sd=0.20, snap_copy=(0.2, 0.9), snap_pool=(1, 2),
+    snap_mean_acc=(0.35, 0.95), snap_acc_sd=0.20, snap_copy=(0.2, 1.0), snap_pool=(1, 2),
+    # v3 (every range includes the v2 behaviour: 0 feeds, field_corr 1.0)
+    snap_feeds=(0, 8), snap_feed_share=(0.0, 0.8), snap_field_corr=(0.0, 1.0),
+    # v3, audit addition: share of correct num_rel readings that state the exact true value (0 = always jittered)
+    snap_exact_valid=(0.0, 1.0),
 )
 KNOBS: Dict[str, Dict[str, Any]] = {
     "train": dict(_TRAIN),
@@ -82,6 +124,9 @@ KNOBS: Dict[str, Dict[str, Any]] = {
     ),
     "snapshot": dict(_TRAIN, p_snapshot=1.0),
 }
+KNOBS["test_hard"] = dict(KNOBS["hard"])
+KNOBS["test_heldout"] = dict(KNOBS["heldout"])
+KNOBS["test_snapshot"] = dict(KNOBS["snapshot"])
 
 DIETS = ["dry kibble", "wet food", "raw diet", "prescription renal", "prescription urinary",
          "weight management", "grain-free", "senior formula", "hypoallergenic"]
@@ -270,6 +315,7 @@ class Emitter:
         self.now = case["now_day"]
         self.lb_locale = rng.random() < K["lb_locale"]
         self.assertions: List[Dict[str, Any]] = []
+        self.next_tmp_id = 0          # v0.5: a counter (v2 used len(self.assertions), reused after removals)
 
     # ---- low level
     def add(self, field: str, value: Any, observed_day: int, arrived_day: int, source: str,
@@ -281,7 +327,8 @@ class Emitter:
         a = {"id": None, "field": field, "value": value, "unit": unit,
              "observed_day": observed_day, "arrived_day": arrived_day, "source": source,
              "extractor_conf": extractor_conf, "error_type": error_type, "text": text,
-             "corrects": corrects, "duplicate_of": duplicate_of, "_tmp_id": len(self.assertions)}
+             "corrects": corrects, "duplicate_of": duplicate_of, "_tmp_id": self.next_tmp_id}
+        self.next_tmp_id += 1
         self.assertions.append(a)
         return a
 
@@ -307,8 +354,7 @@ class Emitter:
         elif source == "vet_pdf" and rng.random() < K["p_ocr"]:
             shown = ocr_digit_error(rng, shown)
             err = "ocr_digit"
-        decimals = 2 if shown < 10 else (1 if shown < 100 else 0)
-        return round(shown, decimals), unit, err
+        return shown_round(shown), unit, err
 
     def true_weight_shown(self, day: int) -> Tuple[Any, str]:
         """A correct weight for `day` in the locale's unit (small scale noise, inside tolerance)."""
@@ -316,8 +362,7 @@ class Emitter:
         kg = truth_at(self.case, "weight_kg", day) * (1.0 + clamp(rng.gauss(0.0, 0.01), -0.03, 0.03))
         unit = "lb" if self.lb_locale else "kg"
         shown = kg * LB_PER_KG if unit == "lb" else kg
-        decimals = 2 if shown < 10 else (1 if shown < 100 else 0)
-        return round(shown, decimals), unit
+        return shown_round(shown), unit
 
     # ---- sources
     def emit_owner(self) -> None:
@@ -438,7 +483,7 @@ class Emitter:
             if rng.random() < 0.7:
                 kg = other_adult * (1 + rng.gauss(0, 0.03))
                 unit = "lb" if self.lb_locale else "kg"
-                shown = round(kg * LB_PER_KG if unit == "lb" else kg, 2)
+                shown = shown_round(kg * LB_PER_KG if unit == "lb" else kg)     # v0.5: was round(.., 2)
                 conf = round(rng.uniform(*K["extractor_conf_ok"]), 2) if src == "extractor" else None
                 self.add("weight_kg", shown, od, od, src, unit=unit, error_type="contamination", extractor_conf=conf)
             else:
@@ -489,7 +534,7 @@ class Emitter:
                     continue
                 true_kg = truth_at(case, "weight_kg", a["observed_day"]) * (1 + rng.gauss(0, 0.01))
                 unit = "lb" if self.lb_locale else "kg"
-                shown = round(true_kg * LB_PER_KG if unit == "lb" else true_kg, 2)
+                shown = shown_round(true_kg * LB_PER_KG if unit == "lb" else true_kg)     # v0.5: was round(.., 2)
                 arr = a["arrived_day"] + rng.randint(1, 30)
                 if arr <= self.now:
                     self.add("weight_kg", shown, a["observed_day"], arr, "owner", unit=unit, corrects=a["_tmp_id"])
@@ -503,8 +548,7 @@ class Emitter:
                 else:
                     value, unit = self.true_weight_shown(a["observed_day"])
                     value = value * rng.choice([rng.uniform(0.55, 0.9), rng.uniform(1.12, 1.6)])
-                    decimals = 2 if value < 10 else (1 if value < 100 else 0)
-                    self.add("weight_kg", round(value, decimals), a["observed_day"], arr, "owner", unit=unit,
+                    self.add("weight_kg", shown_round(value), a["observed_day"], arr, "owner", unit=unit,
                              error_type="bad_correction", corrects=a["_tmp_id"])
 
     def add_undecidable(self) -> Optional[str]:
@@ -525,7 +569,9 @@ class Emitter:
         regimes.append([d, chosen])
         case["truth"][field] = regimes
         for v in (v_a, v_b):
-            self.add(field, v, d, d, "owner", error_type=None if v == chosen else "undecidable_pair")
+            a = self.add(field, v, d, d, "owner", error_type=None if v == chosen else "undecidable_pair")
+            a["_undec"] = True        # v0.5: recorded as case["undecidable_ids"] (not an input; for the scorer only)
+        self.undec_other = v_b if chosen == v_a else v_a     # the outcome the coin did not choose (no RNG used)
         return field
 
 
@@ -540,8 +586,8 @@ def ocr_digit_error(rng: random.Random, shown: float) -> float:
         new = "9"
     out = float(s[:i] + new + s[i + 1:])
     if abs(out - shown) / max(shown, 1e-9) <= TOL_WEIGHT_REL:
-        out = shown * 1.35
-    return out
+        return shown * 1.35
+    return out + (shown - float(s))           # v0.5: keep the digits after the first decimal (same test as v2 above)
 
 
 # ============================================================ labeling
@@ -612,16 +658,38 @@ def snapshot_wrong_value(rng: random.Random, field: str, truth: Any) -> Any:
 
 def gen_snapshot_case(rng: random.Random, split: str, idx: int) -> Dict[str, Any]:
     """Many anonymous sources, generic fields, every claim on day 0, correlated (copied) errors.
-    Labels: valid / erroneous only (no time, so nothing can be superseded)."""
+    Labels: valid / erroneous only (no time, so nothing can be superseded).
+
+    v3: the claims come from *emitters*. An emitter is either an independent source or a feed; a feed's member
+    sources show the feed's rows verbatim (same fields, same values), the way flightview / panynj / foxbusiness /
+    allegiantair are one feed in the Flight set. Each emitter has a per-field accuracy that is a blend (field_corr)
+    of its own mean and an independent per-field draw, so a source can be reliable on one field and not another.
+    copy_rate may reach 1.0, so a field can have exactly one wrong value shared by everyone who is wrong."""
     K = KNOBS[split]
     n_src = rng.randint(*K["snap_sources"])
     n_fields = rng.randint(*K["snap_fields"])
     fields = rng.sample(sorted(SNAPSHOT_FIELDS), min(n_fields, len(SNAPSHOT_FIELDS)))
     sources = ["src_%02d" % i for i in range(n_src)]
-    mean_acc = rng.uniform(*K["snap_mean_acc"])          # how reliable this case's sources are on average
-    copy_rate = rng.uniform(*K["snap_copy"])             # how much wrong values are shared (copied) across sources
-    acc = {s: clamp(rng.gauss(mean_acc, K["snap_acc_sd"]), 0.05, 0.99) for s in sources}
-    cover = {s: rng.uniform(*K["snap_cover"]) for s in sources}
+    mean_acc = rng.uniform(*K["snap_mean_acc"])          # how reliable this case's emitters are on average
+    copy_rate = rng.uniform(*K["snap_copy"])             # how much wrong values are shared (copied) across emitters
+    field_corr = rng.uniform(*K["snap_field_corr"])      # 1.0 = one accuracy per emitter (v2); 0.0 = independent per field
+    exact_valid = rng.uniform(*K["snap_exact_valid"])    # share of correct num_rel readings stating the exact true value
+    n_feeds = rng.randint(*K["snap_feeds"])              # upper bound on feeds in this case; 0 = no feeds (v2)
+    feed_share = rng.uniform(*K["snap_feed_share"]) if n_feeds > 0 else 0.0
+    feed_of: Dict[str, int] = {}
+    members = [s for s in sources if n_feeds > 0 and rng.random() < feed_share]
+    rng.shuffle(members)
+    k = 0
+    while len(members) >= 2 and k < n_feeds:            # feeds of 2-4 members, like the Flight set; leftovers stay independent
+        size = min(len(members), rng.randint(2, 4))
+        if len(members) - size == 1:
+            size += 1
+        for s in members[:size]:
+            feed_of[s] = k
+        members = members[size:]
+        k += 1
+    emitters: List[Tuple[str, Any]] = [("src", s) for s in sources if s not in feed_of] + \
+                                      [("feed", k) for k in sorted(set(feed_of.values()))]
     truth_values: Dict[str, Any] = {}
     for f in fields:
         t, tol = SNAPSHOT_FIELDS[f]
@@ -633,19 +701,37 @@ def gen_snapshot_case(rng: random.Random, split: str, idx: int) -> Dict[str, Any
             truth_values[f] = rng.randint(0, 2000)
     pools = {f: [snapshot_wrong_value(rng, f, truth_values[f]) for _ in range(rng.randint(*K["snap_pool"]))]
              for f in fields}
-    assertions = []
-    for s in sources:
+    acc_mean: Dict[Tuple[str, Any], float] = {}
+    acc: Dict[Tuple[str, Any], Dict[str, float]] = {}
+    rows: Dict[Tuple[str, Any], Dict[str, Tuple[Any, Optional[str], str]]] = {}   # emitter -> field -> (value, err, label)
+    for e in emitters:
+        acc_mean[e] = clamp(rng.gauss(mean_acc, K["snap_acc_sd"]), 0.05, 0.99)
+        cover = rng.uniform(*K["snap_cover"])
+        acc[e] = {}
+        rows[e] = {}
         for f in fields:
-            if rng.random() > cover[s]:
+            own = clamp(rng.gauss(mean_acc, K["snap_acc_sd"]), 0.05, 0.99)
+            acc[e][f] = clamp(field_corr * acc_mean[e] + (1.0 - field_corr) * own, 0.05, 0.99)
+            if rng.random() > cover:
                 continue
-            if rng.random() < acc[s]:
+            if rng.random() < acc[e][f]:
                 value, err, label = truth_values[f], None, "valid"
-                if SNAPSHOT_FIELDS[f][0] == "num_rel":
+                if SNAPSHOT_FIELDS[f][0] == "num_rel" and rng.random() >= exact_valid:
                     value = round(value * (1 + rng.uniform(-0.3, 0.3) * SNAPSHOT_FIELDS[f][1]), 2)   # inside tolerance
             elif rng.random() < copy_rate:
                 value, err, label = rng.choice(pools[f]), "copied_error", "erroneous"
             else:
                 value, err, label = snapshot_wrong_value(rng, f, truth_values[f]), "source_error", "erroneous"
+            rows[e][f] = (value, err, label)
+    assertions = []
+    for s in sources:
+        e = ("feed", feed_of[s]) if s in feed_of else ("src", s)
+        for f in fields:
+            if f not in rows[e]:
+                continue
+            value, err, label = rows[e][f]
+            if err is not None and e[0] == "feed":
+                err = "feed_error"                        # a wrong value carried verbatim by a block of sources
             assertions.append({"id": len(assertions), "field": f, "value": value, "unit": None,
                                "observed_day": 0, "arrived_day": 0, "source": s, "extractor_conf": None,
                                "error_type": err, "text": None, "corrects": None, "duplicate_of": None, "label": label})
@@ -663,12 +749,17 @@ def gen_snapshot_case(rng: random.Random, split: str, idx: int) -> Dict[str, Any
             q["tolerance"] = "%g absolute" % tol
         queries.append(q)
     types = sorted(set(a["error_type"] for a in assertions if a["error_type"]))
+    emitter_of = {s: (("feed", feed_of[s]) if s in feed_of else ("src", s)) for s in sources}
     return {"case_id": "%s-%05d" % (split, idx), "split": split, "regime": "snapshot", "now_day": 0,
             "truth_values": {f: truth_values[f] for f in present},
             "field_types": {f: SNAPSHOT_FIELDS[f] for f in present},
-            "source_accuracy": {s: round(acc[s], 3) for s in sources},
-            "snapshot_params": {"mean_acc": round(mean_acc, 3), "copy_rate": round(copy_rate, 3)},
-            "assertions": assertions, "queries": queries, "conflict_types": types,
+            "source_accuracy": {s: round(acc_mean[emitter_of[s]], 3) for s in sources},
+            "field_accuracy": {s: {f: round(acc[emitter_of[s]][f], 3) for f in fields} for s in sources},
+            "snapshot_params": {"mean_acc": round(mean_acc, 3), "copy_rate": round(copy_rate, 3),
+                                "field_corr": round(field_corr, 3), "exact_valid": round(exact_valid, 3),
+                                "n_feeds": len(set(feed_of.values())),
+                                "feed_share": round(feed_share, 3), "feed_of": {s: "feed_%d" % k for s, k in feed_of.items()}},
+            "assertions": assertions, "queries": queries, "conflict_types": types, "undecidable_ids": [],
             "knobs": {k: v for k, v in K.items() if k.startswith("snap_")}}
 
 
@@ -696,6 +787,7 @@ def gen_case(rng: random.Random, split: str, idx: int) -> Dict[str, Any]:
     remap = {}
     for i, a in enumerate(assertions):
         remap[a["_tmp_id"]] = i
+    undecidable_ids = []
     for i, a in enumerate(assertions):
         a["id"] = i
         if a["corrects"] is not None:
@@ -703,8 +795,20 @@ def gen_case(rng: random.Random, split: str, idx: int) -> Dict[str, Any]:
         if a["duplicate_of"] is not None:
             a["duplicate_of"] = remap.get(a["duplicate_of"])
         del a["_tmp_id"]
+        if a.pop("_undec", False):
+            undecidable_ids.append(i)
     case["assertions"] = assertions
     label_assertions(case)
+    if undecidable_field:
+        # every entry whose label the coin decided: re-label the field with the other outcome and compare
+        regs = [list(sv) for sv in case["truth"][undecidable_field]]
+        regs[-1] = [regs[-1][0], em.undec_other]
+        alt = {"now_day": case["now_day"], "truth": dict(case["truth"], **{undecidable_field: regs}),
+               "assertions": [dict(a) for a in assertions if a["field"] == undecidable_field]}
+        label_assertions(alt)
+        flipped = [b["id"] for b in alt["assertions"] if b["label"] != assertions[b["id"]]["label"]]
+        undecidable_ids = sorted(set(undecidable_ids) | set(flipped))
+    case["undecidable_ids"] = undecidable_ids
     case["queries"] = build_queries(case, undecidable_field)
     types = sorted(set(a["error_type"] for a in assertions if a["error_type"]))
     if undecidable_field:
@@ -722,7 +826,11 @@ def gen_case(rng: random.Random, split: str, idx: int) -> Dict[str, Any]:
 
 def main() -> None:
     t0 = time.time()
-    for split, n in N_CASES.items():
+    splits = dict(N_CASES)
+    if MAKE_TEST_SPLITS:
+        print("*** MAKE_TEST_SPLITS = True: writing the sealed test splits. Do this once, after v0.5 is frozen. ***")
+        splits.update(TEST_SPLITS)
+    for split, n in splits.items():
         rng = random.Random(SEED + SPLIT_SEED[split])
         cases = [gen_case(rng, split, i) for i in range(n)]
         write_jsonl(OUT_FILES[split], cases)
