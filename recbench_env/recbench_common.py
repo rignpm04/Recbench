@@ -43,11 +43,15 @@ SOURCES = ["owner", "vet_pdf", "extractor", "email_forward", "note_text"]
 # these (plus any cases_*.jsonl present), so a prediction file is never misfiled when its cases file is absent
 KNOWN_SPLITS = ["train", "val", "heldout", "hard", "snapshot", "test_hard", "test_heldout", "test_snapshot",
                 "stock", "stock_nogold", "flight", "flight_dev", "flight_test", "flight_dev_nogold", "flight_test_nogold",
-                "book", "book_subset"]
+                "book", "book_subset",
+                "parliament_dev", "parliament_dev_nobot", "parliament_test", "parliament_test_nobot"]
 
 # ---------------------------------------------------------------- generic (real-data) fields
 # Real-data cases (realdata_map.py) carry their own field definitions:
 #   case["field_types"] = {field: ["num_rel", 0.01] | ["num_abs", 10] | ["cat", null]}
+# A longitudinal real set (parliament_map.py) declares recbench's temporal types instead -- ["regime_cat", null] for a
+# category that holds for a period and then changes, ["drift_num", 0] for a number that changes over time (compared
+# exactly: match() applies weight_kg's 4% only to weight_kg).
 # load_jsonl registers them here so match()/cluster()/is_numeric() work without per-field code.
 EXTRA_FIELD_TYPES: Dict[str, str] = {}
 EXTRA_TOL: Dict[str, float] = {}
