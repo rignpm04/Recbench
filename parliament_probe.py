@@ -26,8 +26,10 @@
 # Reference date per member: the run date if still in the Commons, else the member's last day there (the earliest
 # end date among Parliament's three member endpoints).
 #
-# Writes realdata/parliament_probe/ (gitignored through realdata/): cache/ (every download), run_date.txt,
-# probe_entries.jsonl (every entry with its label), probe_summary.json. Delete that folder to start over.
+# Writes parliament_data/probe/ (add parliament_data/ to .gitignore): cache/ (every download), run_date.txt,
+# probe_entries.jsonl (every entry with its label), probe_summary.json. Delete that folder to start over. (Until
+# Oct 10 this was realdata/parliament_probe/; it is moved automatically -- realdata/ is the public sets' folder, and
+# realdata_map.py reads every file in it.)
 
 import calendar
 import gzip
@@ -54,7 +56,7 @@ FRAME_START = "2015-05-07"           # 2015 general election
 RUN_DATE = None                      # None = today (UTC) on the first run, then frozen in run_date.txt
 SNAPSHOT_DAYS = 2                    # sources' first entry = their value this many days after the window opens
 CANT_TELL_MARGIN_DAYS = 1            # Parliament's dates are days; source edits are to the second
-OUT_DIR = os.path.join("realdata", "parliament_probe")
+OUT_DIR = os.path.join("parliament_data", "probe")
 USER_AGENT = "recbench-parliament-probe/0.1 (https://github.com/rignpm04/Recbench)"   # Wikimedia requires a contact
 PARLIAMENT_API = "https://members-api.parliament.uk/api"
 WIKIDATA_API = "https://www.wikidata.org/w/api.php"
@@ -80,6 +82,24 @@ GO_MAX_MACHINE_COPIED = 0.25     # share of all entries put in by a bot or tool 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, OUT_DIR)
 CACHE = os.path.join(OUT, "cache")
+# where earlier versions kept their output, inside realdata/ (the public-set folder realdata_map.py reads in full)
+OLD_FOLDERS = {os.path.join(HERE, "realdata", "parliament_probe"): OUT,
+               os.path.join(HERE, "realdata", "parliament_cases"): os.path.join(HERE, "parliament_data", "cases")}
+
+
+def move_old_folders() -> None:
+    """Moves realdata/parliament_probe and realdata/parliament_cases (Oct 10 builds) to parliament_data/, once, so the
+    download cache and the frozen run date are kept and realdata_map.py never reads them."""
+    for old, new in OLD_FOLDERS.items():
+        if not os.path.isdir(old):
+            continue
+        if os.path.exists(new):
+            raise SystemExit("Both %s and %s exist. Move what is inside the first into the second (Finder), delete the "
+                             "first, and press Run again." % (os.path.relpath(old, HERE), os.path.relpath(new, HERE)))
+        os.makedirs(os.path.dirname(new), exist_ok=True)
+        os.rename(old, new)
+        print("moved %s -> %s (realdata/ is for the public sets only)" % (os.path.relpath(old, HERE),
+                                                                        os.path.relpath(new, HERE)))
 DAY = 86400
 UNDEF = "<no value>"        # answer key has no value then (not in the Commons, or no election result found)
 UNCLEAR = "<unclear>"       # Parliament's endpoints disagree
@@ -273,7 +293,7 @@ PARTY_RULES = [
     (r"\brespect\b", "respect"),
     (r"co ?operative|\blabour\b", "labour"),
     (r"conservative|\btory\b|\btories\b", "conservative"),
-    (r"\bindependents?\b|non affiliated|no party", "independent"),
+    (r"\bindependents?\b|non affiliated|no party|^none\b", "independent"),
     (r"\byour party\b", "yourparty"),
 ]
 
@@ -305,6 +325,7 @@ def norm_cons(s: Optional[str]) -> Optional[str]:
     t = re.sub(r"\([^)]*\)", " ", t).replace("&", " and ")
     t = re.sub(r"\buk parliament constituency\b|\bparliamentary constituency\b|\bconstituency\b", " ", t)
     t = re.sub(r"[^a-z0-9]+", " ", t).strip()
+    t = re.sub(r"\bkingston upon hull\b", "hull", t)      # Parliament: "Kingston upon Hull East"; pages: "Hull East"
     return t or None
 
 
@@ -465,6 +486,8 @@ def parse_majority(v: str) -> Optional[int]:
 
 
 _MP_OFFICE = re.compile(r"member of parliament\b|^\s*mp\b", re.I)
+_ANNOTATION = re.compile(r"^(?:[\s()\[\],.;:/\-\u2013\u2014]|\d|present|since|until|from|to|current|incumbent|and|"
+                         r"onwards|c\.)*$", re.I)     # a line holding only dates / "present" / brackets
 
 
 def wp_values(params: Dict[str, str]) -> Dict[str, Any]:
@@ -479,13 +502,18 @@ def wp_values(params: Dict[str, str]) -> Dict[str, Any]:
         raw = None
     if raw is not None:
         pre = unwrap_templates(clean_refs(raw))
-        cands = []
+        cands: List[List[str]] = []          # [context text, party name]
         for seg in re.split(r"<br\s*/?>|\n|\*|\u2022|;", pre, flags=re.I):
             txt = strip_markup(seg)
             if not txt:
                 continue
             links = re.findall(r"\[\[([^\[\]|]+)(?:\|([^\[\]]*))?\]\]", seg)
-            cands.append((txt, (links[0][1] or links[0][0]) if links else txt))
+            if links:
+                cands.append([txt, links[0][1] or links[0][0]])
+            elif _ANNOTATION.match(txt) and cands:
+                cands[-1][0] += " " + txt      # "(2019-present)" on its own line dates the party above it
+            elif not _ANNOTATION.match(txt):
+                cands.append([txt, re.sub(r"\([^)]*\d{4}[^)]*\)", " ", txt).strip()])
         if cands:
             pick = cands[0]
             if len(cands) > 1:
@@ -1098,8 +1126,9 @@ def enwiki_history(title: str, snap: int, ref: int) -> Tuple[List[Tuple[int, dic
 
 
 def to_entries(mid: int, source: str, timeline: List[Tuple[int, dict, Any, bool]], fields: List[str],
-               values_at: Any) -> List[dict]:
-    """One entry per change of a field's value (the first value counts as a change)."""
+               values_at: Any, gaps: Tuple[Any, ...] = ()) -> List[dict]:
+    """One entry per change of a field's value (the first value counts as a change). Values in `gaps` (and None,
+    AMBIG) are gaps, not values: after a gap the next value counts only if it differs from the last value."""
     prev: Dict[str, Any] = {f: None for f in fields}
     out = []
     for t, rev, payload, is_snapshot in timeline:
@@ -1112,7 +1141,7 @@ def to_entries(mid: int, source: str, timeline: List[Tuple[int, dict, Any, bool]
             v = vals.get(f)
             if v == AMBIG:
                 STATS["ambiguous_%s_%s" % (source, f)] += 1
-            if v is None or v == AMBIG:      # a gap, not a value: the next value counts only if it differs
+            if v is None or v == AMBIG or v in gaps:   # a gap, not a value: the next value counts only if it differs
                 continue
             if v != prev[f]:
                 e = {"member": mid, "source": source, "field": f, "value": v, "raw": vals["_raw"].get(f),
@@ -1139,6 +1168,7 @@ def pct(a: float, b: float) -> str:
 
 # ============================================================ main
 def main() -> None:
+    move_old_folders()
     os.makedirs(CACHE, exist_ok=True)
     t_start = time.time()
     run_day = load_run_date()

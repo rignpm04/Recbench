@@ -70,22 +70,28 @@ THINKING = _P["thinking"]                    # Anthropic only: {"type": "between
 USE_BATCH = _P["batch"]                      # Anthropic only: Message Batches API
 
 MODE = "zero_shot"                           # "zero_shot" | "few_shot" | "cot_sc"
-SPLIT = "hard"                               # "train" | "val" | "heldout" | "hard" | "snapshot"
+SPLIT = "hard"                               # "train" | "val" | "hard" | ... | "parliament_dev" (cases_<SPLIT>.jsonl)
 MAX_CASES = 200                              # first N cases of the split (None = all)
 SMOKE = False                                # True: a 3-case check of every form on train, files smoke_* (see header)
 # One Run button press runs every (mode, split) pair in BATCH_RUNS, in order, each resumable (finished cases are
 # skipped, so a stopped run continues where it left off). Set BATCH_RUNS = None to run just MODE / SPLIT above.
 # v0.5 has two lists:
-#   BATCH_RUNS_DEV   -- phase 1, DeepSeek only (~$3-5): zero-shot on val and hard, CoT on val -- checks the parser, the
-#                       new prompt and CoT cut-offs on development splits before anything is frozen.
-#   BATCH_RUNS_FINAL -- phase 2, after gen.py has written the sealed test splits (MAKE_TEST_SPLITS): the three forms on
+#   BATCH_RUNS_DEV   -- phase 1, DeepSeek only (~$3-5): zero-shot on val and hard, CoT on val, zero-shot on the 50
+#                       Parliament development cases -- checks the parser, the new prompt and CoT cut-offs on
+#                       development splits before anything is frozen.
+#   BATCH_RUNS_FINAL -- phase 2, after gen.py has written the sealed test splits (MAKE_TEST_SPLITS) and
+#                       parliament_map.py has installed the Parliament test files (INSTALL_TEST): the three forms on
 #                       val (calibration) and on the test splits. Run it once per provider (DeepSeek, then Claude).
-BATCH_RUNS_DEV = [("zero_shot", "val"), ("zero_shot", "hard"), ("cot_sc", "val")]
+# (Parliament amendment, PREDICTIONS.md: the Parliament runs were added before any method read a Parliament case.)
+BATCH_RUNS_DEV = [("zero_shot", "val"), ("zero_shot", "hard"), ("cot_sc", "val"), ("zero_shot", "parliament_dev")]
 BATCH_RUNS_FINAL = [("zero_shot", "val"), ("few_shot", "val"), ("cot_sc", "val"),
                     ("zero_shot", "test_hard"), ("zero_shot", "test_heldout"),
                     ("few_shot", "test_hard"), ("few_shot", "test_heldout"),
                     ("cot_sc", "test_hard"), ("cot_sc", "test_heldout"),
-                    ("zero_shot", "test_snapshot")]
+                    ("zero_shot", "test_snapshot"),
+                    ("zero_shot", "parliament_test"), ("few_shot", "parliament_test"), ("cot_sc", "parliament_test"),
+                    ("zero_shot", "parliament_test_nobot"), ("few_shot", "parliament_test_nobot"),
+                    ("cot_sc", "parliament_test_nobot")]
 BATCH_RUNS = BATCH_RUNS_DEV
 
 N_SHOTS = 2                                  # few_shot: worked examples taken from cases_train.jsonl

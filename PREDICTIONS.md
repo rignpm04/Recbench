@@ -273,3 +273,170 @@ No prediction above is edited. The LLM protocol changes as follows, because of h
 - **Items 27 (LoRA) and 28 (scaling) are deferred to v0.6.** They are not run in v0.5. If they are run, it is in v0.6
   with their own pre-registration, each model frozen on development data before it touches a test split, and
   reported whatever it shows.
+
+---
+
+# Parliament amendment (Oct 10, 2026, before any method read a Parliament case)
+
+Committed with `parliament_probe.py`, `parliament_map.py` and the script changes listed below. No prediction above is
+edited. This adds a real longitudinal set to v0.5: members of the UK House of Commons, their party, seat and majority
+as stated over time by English Wikipedia and Wikidata, graded against the UK Parliament Members API. It is the first
+set in recbench with a time dimension and a "superseded" label that is not generated. Phase 1 reads its 50 development
+cases; its 400 test cases are built during phase 1, sealed, and read only in phase 2, after the freeze.
+
+## Honesty note: what was seen before this was written
+
+- **The probe** (`parliament_probe.py`, run twice on the 50 development members, the second time after parser fixes):
+  its report -- label counts by source and field (enwiki majority: 51 valid, 66 superseded, 34 erroneous), update lags
+  (median 0.7-4.8 days after a real change), the copying table (60% of the Wikidata entries made inside the window
+  came from bot or tool edits, none citing Parliament's data), a list of about 30 entries whose value never occurs in
+  Parliament's records, with their labels (vandalism, edits to the wrong item, typos, annotations the parser then
+  misread -- since fixed), and the GO verdict. These are development members.
+- **The development build** (`parliament_map.py`, 50 cases), counts only: 460 entries (median 9 per case, max 25;
+  enwiki 337, wikidata 50, wikidata_bot 73); labels valid 244, superseded 117, erroneous 47, can't tell 52; 50 queries
+  per field; without the bot entries 387 entries (valid 182, superseded 108, erroneous 47, can't tell 50).
+- **No method -- rule, learned model or LLM -- has read a Parliament case.** No test member's history has been
+  downloaded.
+- **Changes to the mapping after that build, before any method run**, none of which changes an entry or a label: (1)
+  the fields are declared with recbench's temporal types (party and seat `regime_cat`, majority `drift_num`) instead
+  of the generic same-day types the build used (`cat`, `num_abs`), for the reason in the next item; (2) entries are
+  listed day by day, as generated longitudinal records are (same-day entries in a seeded random order, v0.5 change 6),
+  instead of fully shuffled; (3) the `_nobot` cases get their own case ids; (4) everything the two Parliament scripts
+  keep moved from `realdata/` to `parliament_data/`, because `realdata_map.py` reads every file under `realdata/` (the
+  download cache and the sealed test files must not be among them).
+- **A sandbox check on synthetic data (`val`, longitudinal records only; no Parliament data), Oct 10.** Prompted by
+  this set: in the v0.5 prior, unknown fields and sources (the "other" embeddings) occur only in same-day snapshot
+  records. The v0.5 reconciler checkpoint trained in the sandbox at full length (honesty note above) was run on val
+  records cut to their diet / medication / clinic entries, with the field and source names replaced by names it has
+  never seen. Superseded recall on those entries: 0.88 with the names kept, 0.15 renamed with the fields declared
+  `regime_cat`, 0.00 with `cat`; q_acc 91.9% -> 85.1% / 74.7% (newest_observed: 91.5%). Weight alone, renamed and
+  declared `drift_num`: superseded recall 0.68 -> 0.19. The sandbox feature model (trained on only 1,280 stream cases)
+  kept its numbers when renamed (`regime_cat`: q_acc 92.2%, macro-F1 0.898 vs 0.911 named; `cat`: 90.5%, 0.742). This
+  is why the types were changed and why `reconciler_anon` (below) exists. A reconciler trained with `ANON = True`
+  (same seed-1 stream, CPU) on the same check: superseded recall 0.82 renamed with `regime_cat` (0.10 with `cat`: the
+  declared type still matters), q_acc 91.6%; weight alone renamed 0.57 (0.56 with its name); the four fields together
+  renamed: superseded recall 0.74 and entry macro-F1 0.829 (v0.5 checkpoint: 0.21, 0.613); on the val records as
+  generated, q_acc 95.1% and macro-F1 0.892 on the longitudinal ones (v0.5 checkpoint: 95.1%, 0.894), 86.5% on the
+  snapshot ones (85.3%). Its full run's printout: val q_acc 0.946, entry macro-F1 0.879 (v0.5 checkpoint: 0.944,
+  0.880). No setting was tuned on these numbers (`P_ANON = 0.25` was fixed before the run).
+- **An independent review** (a fresh model instance, Oct 10) of the scripts and of a draft of this section. It led to
+  (3), (4) and the same-day rule in (2), to the definitions under "How the predictions are read", to item 35's
+  wording, and to the consequences added under the kill criteria. No prediction's threshold was changed after it; item
+  31's kill criterion was set at a clear miss (3 points, 0.60) after the final sandbox run, whose superseded recall on
+  renamed records (0.74) sits close to the prediction's 0.70.
+
+## The set (`parliament_map.py`; downloads, parsers and answer key in `parliament_probe.py`)
+
+- **Frame:** every House of Commons member active between 2015-05-07 and 2026-10-10 (1,271 members). One seeded
+  shuffle (seed 20261010); a member is taken in that order when their Wikidata item is found (the single item carrying
+  their Parliament id, property P10428, else the item in mySociety's people.json at a pinned commit), Parliament's
+  records give a Commons seat in the frame, and they sat more than 3 days in it. **Development (`parliament_dev`)** =
+  the first 50 taken (the probe's sample); **test (`parliament_test`)** = the next 400.
+- **One case per member.** Fields `parliament.party`, `parliament.constituency` (`regime_cat`) and
+  `parliament.majority` (`drift_num`, compared exactly). Entries: every change of a field's value in the member's
+  English Wikipedia infobox (lead section) and Wikidata item, from the first revision up to the reference date, each
+  dated by its edit (observed day = arrived day) and listed day by day (same-day entries in a seeded random order);
+  "not an MP" values, unreadable revisions and revisions showing two current values are gaps. Sources: `enwiki`,
+  `wikidata` (edits by people), `wikidata_bot` (bots and tools such as QuickStatements). A member with no entry or no
+  answerable field gives no case (the build prints how many), so a file can hold fewer than 400 cases.
+- **Answer key and labels:** Parliament's records (party, seat, majority of the election that began the seat term) on
+  the reference date -- 2026-10-10 for sitting members, else the member's last Commons day -- and on each entry's day;
+  recbench's rule (wrong on its day -> erroneous; right then and at the reference date -> valid; right then, changed
+  since -> superseded). An entry is "can't tell" (in `undecidable_ids`, left out of every per-entry metric, as the
+  generator's coin flips are) when Parliament has no single clear value on its day or on the reference date, or when
+  moving it by one day would change its label. A field gets a query when it has an entry and a clear answer.
+- **`_nobot` variants** (`parliament_dev_nobot`, `parliament_test_nobot`; case ids `parliament_nobot-<member>`): the
+  same members without `wikidata_bot` entries (bulk edits carry no references, so they may copy Parliament's own
+  data). A field whose only entries came from bots has no query there.
+
+## Script changes in this commit
+
+- `KNOWN_SPLITS` (both copies of `recbench_common.py`), `REAL_SPLITS` (`train_reconciler.py`), `EVAL_FILES`
+  (`feature_baseline.py`): the four Parliament files.
+- `llm_baseline.py`: `BATCH_RUNS_DEV` adds DeepSeek zero-shot on `parliament_dev`; `BATCH_RUNS_FINAL` adds the three
+  forms on `parliament_test` and on `parliament_test_nobot` (first 200 cases each, `MAX_CASES`). Same prompt (it
+  already states each field's tolerance and the label rules), parser and models. Estimated cost: about $15 for Claude
+  through the Batch API and $2 for DeepSeek.
+- `train_reconciler.py`: **`ANON = True` trains `reconciler_anon`**, identical to the reconciler except that a share
+  `P_ANON = 0.25` of its training records is encoded without field and source identities (every field and source gets
+  the "other" embedding; local ids, types and features unchanged). Same 160,000 training cases, seed 1, fixed
+  settings, last epoch. With `ANON = False` the training stream and the model are exactly v0.5's (checked bit for bit
+  in the sandbox, twice). The reconciler of items 15-26 is unchanged; `reconciler_anon` is an added row.
+- `score.py`: `reconciler_anon` joins the pairwise comparisons; the full-split table ("all N cases") also prints the
+  per-label precision / recall.
+
+## Protocol
+
+- **Phase 1:** `parliament_map.py` writes `parliament_dev` (+ `_nobot`) next to the scripts first, then downloads the
+  test members and seals `parliament_test` (+ `_nobot`) in `parliament_data/cases/`, printing their size and SHA-256
+  fingerprints but no labels. It refuses to run while any file of the test split sits next to the scripts. Every
+  non-LLM method runs on `parliament_dev` as on the other development splits; `reconciler_anon` is trained (seed 1,
+  with the leak test); DeepSeek zero-shot reads `parliament_dev`. Nothing in phase 1 is a result. A mapping bug found
+  on `parliament_dev` may be fixed before the freeze: the fix, the dev counts before and after, and the rebuilt test
+  files' new fingerprints go into `v0.5: frozen`.
+- **Freeze:** `v0.5: frozen` lists the fingerprints of the sealed test files.
+- **Phase 2:** `parliament_map.py` with `INSTALL_TEST = True` copies the sealed files next to the scripts (no rebuild,
+  no download) and prints their fingerprints, which must equal the frozen ones. Every frozen method runs on them
+  (learned models from their checkpoints; the seed-1 reconciler and `reconciler_anon` with the leak test); the LLM
+  forms read the first 200 cases of each file (`BATCH_RUNS_FINAL`). Temperatures are the `val` ones; no Parliament
+  data is used for tuning or calibration.
+- **Caveats stated with the results:** the case text names parties and constituencies, so an LLM may answer from what
+  it learned in pre-training (no control is run); Wikipedia's and Wikidata's histories are public and may be in any
+  model's pre-training data; supersession concentrates in members who sat through several elections.
+
+## How the predictions are read
+
+From `score.py` after `calibrate.py`, on `parliament_test` (every case in the file) unless stated. Methods that cover
+every case are read from the full-split table ("all N cases") and its per-label block; any comparison with an LLM form
+uses the common-cases table (the LLM's 200 cases). "Classical methods" = the seven of `baselines.py` (newest_observed,
+newest_arrival, source_priority, majority_vote, time_decayed_vote, dawid_skene, truthfinder); "learned models" =
+`reconciler_anon` and `feat_hgb` (seed 1 each); "the reconciler" = v0.5's seed-1 `reconciler`. Macro-F1 is score.py's
+macro-F1 over the classes present; a "point" is a percentage point of q_acc. A prediction with several clauses is
+scored clause by clause.
+
+## Predictions (blind)
+
+29. **Leak test (requirement).** The reconciler and `reconciler_anon` pass item 15's leak test on `parliament_test`
+    and `parliament_test_nobot`.
+30. **The gap.** The reconciler's superseded recall is below 0.50, and its q_acc is at least 3 points below
+    `newest_observed`'s: it reads these records as snapshots.
+31. **The fix.** `reconciler_anon` is within 1.5 points of `newest_observed` on q_acc (either way) and at least 3
+    points above the reconciler; its superseded recall is >= 0.70; its entry macro-F1 exceeds the reconciler's by >=
+    0.10. On `test_hard` and `test_heldout` it is within 0.5 points of the reconciler's q_acc and within 0.02 of its
+    entry macro-F1 (hiding names costs nothing on the records it was built for).
+32. **Feature model.** `feat_hgb` is within 1.5 points of `newest_observed` on q_acc with superseded recall >= 0.70,
+    and `reconciler_anon` minus `feat_hgb` is within 1.5 points on q_acc and within 0.05 on entry macro-F1 (item 19's
+    parity, on real records).
+33. **Rules.** `newest_observed` reaches q_acc >= 90%; `majority_vote` is at least 2 points below it (old values pile
+    up entries across sources and reverts; on Flight, voting is the strong rule); every classical method's erroneous
+    recall is below 0.20 (item 3, on real records).
+34. **Real errors.** At least one learned model has erroneous recall >= 0.25. On the 200 LLM cases: every LLM form's
+    q_acc is within 3 points of `newest_observed`'s; at least one Claude form has erroneous recall >= 0.40 and above
+    both learned models'; at least one Claude form has an entry macro-F1 at least as high as both learned models'
+    (vandalism, edits to the wrong member and typos are easier to see with language and world knowledge than with
+    structure).
+35. **Bots do not carry the results.** For each classical method, each learned model, the reconciler and each LLM
+    form, q_acc on `parliament_test_nobot` is within 2 points of its `parliament_test` value (same tables and case
+    sets as above; the `_nobot` file lacks only the queries whose every entry came from a bot).
+
+## Kill criteria and consequences (Parliament)
+
+- Item 29 fails: stop. No reconciler number on Parliament stands until the leak is found.
+- Item 31 fails clearly (`reconciler_anon` more than 3 points below `newest_observed` on q_acc, or superseded recall
+  below 0.60): hiding names in training is not enough for real dated records. The paper says the reconciler does not
+  transfer to them yet, and v0.6's generator must produce dated records with unfamiliar fields and sources. A milder
+  miss is reported as such. Its last clause fails (`reconciler_anon` more than 0.5 points below the reconciler on
+  `test_hard` or `test_heldout`, or 0.02 on macro-F1): hiding names has a cost in distribution; both rows are reported
+  with that trade-off.
+- Item 30 fails (the reconciler within 3 points of `newest_observed` with superseded recall >= 0.50): the synthetic
+  diagnosis did not carry over to real records. Both rows are reported and the paper says so.
+- Item 32 holds: the feature model reads new fields and sources without new code, which corrects the reason given
+  under "Kill criteria (v0.5)" for item 19 ("what the feature model cannot do without new code (new fields and sources
+  ...)"). The reconciler's case on real records then rests on calibration, entry labels and cost, not on transfer, and
+  the paper says so.
+- Item 34's first clause fails (no learned model reaches erroneous recall 0.25): the generator's error processes do
+  not describe real errors (vandalism and its revert, edits to the wrong record). The entry-level error claims are
+  synthetic-only, and v0.6 adds such processes.
+- The LLM form with the highest entry macro-F1 beats the learned model with the highest entry macro-F1 by >= 0.10 (on
+  the 200 cases): "semantics beat structure" on real records (v0.1 kill criterion). The paper proposes the cascade (a
+  learned model for answers and calibration, an LLM pass on the entries it flags).

@@ -37,6 +37,17 @@
 #   - Prediction reads up to EVAL_MAX_ENTRIES entries per record (training keeps MAX_ENTRIES); a longer record is
 #     reported, never silently cut.
 #
+# Parliament amendment (PREDICTIONS.md, Oct 10, before any method read a Parliament case):
+#   - ANON = True trains a second model, "reconciler_anon": identical except that a share P_ANON of the training
+#     records is encoded without field and source identities (every field and source gets the "other" embedding;
+#     the local field / source / value-cluster ids, field types and numeric features are unchanged). In the v0.5
+#     prior, unknown fields and sources only ever occur in same-day snapshot records, so a dated record with unfamiliar
+#     fields and sources (the Parliament set) reads as a snapshot: on synthetic val records with renamed fields and
+#     sources the v0.5 checkpoint labelled 15% of superseded entries superseded (88% with the names kept); a model
+#     trained with P_ANON = 0.25 labelled 82%, and scored the same as v0.5's on the records as generated (val q_acc
+#     0.946 vs 0.944). Prediction is unchanged (pet fields and sources keep their identities). With ANON = False
+#     nothing changes: the training stream and the "reconciler" model are exactly v0.5's. Not combined with PERMUTE.
+#
 # Leak guards: the encoder only ever sees a scrubbed copy of each assertion holding the OBSERVABLE_KEYS below (never
 # label / error_type, never the case's truth); the targets are read separately. Heldout is only monitored per epoch,
 # never used for selection: the reported model is always the last epoch with the fixed settings below.
@@ -77,16 +88,24 @@ VAL_CASES = 300                 # heldout cases used for the per-epoch metrics (
 EVAL_ONLY = False               # True: load CHECKPOINT and only write predictions
 PERMUTE = None                  # None | "within" | "cross"  (control runs; see the header)
 LEAK_TEST = False               # True: after training / loading, run the scrub test (see the header)
+ANON = False                    # True: the "reconciler_anon" variant (Parliament amendment; see the header)
+P_ANON = 0.25                   # ANON only: share of training records encoded without field / source identities
 EVAL_SPLITS = {"train": ("cases_train.jsonl", 500), "val": ("cases_val.jsonl", None),
                "heldout": ("cases_heldout.jsonl", None), "hard": ("cases_hard.jsonl", None),
                "snapshot": ("cases_snapshot.jsonl", None),
                "test_hard": ("cases_test_hard.jsonl", None), "test_heldout": ("cases_test_heldout.jsonl", None),
                "test_snapshot": ("cases_test_snapshot.jsonl", None)}       # missing files are skipped
 REAL_SPLITS = ["stock", "stock_nogold", "flight_dev", "flight_test", "flight_dev_nogold", "flight_test_nogold",
-               "book", "book_subset"]   # scored zero-shot when cases_<name>.jsonl exists
+               "book", "book_subset",
+               "parliament_dev", "parliament_dev_nobot", "parliament_test", "parliament_test_nobot"]
+                                        # scored zero-shot when cases_<name>.jsonl exists
 
 CHECKPOINT = "reconciler.pt" if SEED == 1 else "reconciler_seed%d.pt" % SEED
 METHOD_NAME = "reconciler" if SEED == 1 else "reconciler_seed%d" % SEED
+if ANON:                        # the Parliament variant: own checkpoint and method name
+    assert not PERMUTE, "ANON is not combined with PERMUTE"
+    CHECKPOINT = "reconciler_anon.pt" if SEED == 1 else "reconciler_anon_seed%d.pt" % SEED
+    METHOD_NAME = "reconciler_anon" if SEED == 1 else "reconciler_anon_seed%d" % SEED
 if PERMUTE:                     # the control runs are short: they only have to show chance-level numbers
     assert PERMUTE in ("within", "cross"), PERMUTE
     CHECKPOINT = "reconciler_permuted.pt" if PERMUTE == "within" else "reconciler_permuted_cross.pt"
@@ -115,10 +134,12 @@ def local_slots(rng: random.Random, n_slots: int, n_items: int) -> List[int]:
 
 
 def encode_case(case: Dict[str, Any], rng: random.Random, with_labels: bool = True,
-                permute: Optional[str] = None, max_entries: int = MAX_ENTRIES) -> Optional[Dict[str, Any]]:
+                permute: Optional[str] = None, max_entries: int = MAX_ENTRIES,
+                anonymize: bool = False) -> Optional[Dict[str, Any]]:
     """Turn one case into index/feature arrays plus the query structure.
     The encoder works on a scrubbed copy of the assertions (OBSERVABLE_KEYS only); labels and the true current
-    value are read from the original case only when with_labels is set, and only into the target arrays."""
+    value are read from the original case only when with_labels is set, and only into the target arrays.
+    anonymize (training of reconciler_anon only): every field and source gets the "other" identity."""
     raw = case["assertions"][:max_entries]
     if not raw:
         return None
@@ -180,9 +201,9 @@ def encode_case(case: Dict[str, Any], rng: random.Random, with_labels: bool = Tr
         for a in group:
             i = id_pos[a["id"]]
             ftype_idx[i] = FTYPES.index(ftype_of(f)) if ftype_of(f) in FTYPES else FTYPES.index("cat")
-            field_idx[i] = FIELDS.index(f) if f in FIELDS else len(FIELDS)
+            field_idx[i] = FIELDS.index(f) if (f in FIELDS and not anonymize) else len(FIELDS)
             lfield_idx[i] = loc_field[f]
-            src_idx[i] = SOURCES.index(a["source"]) if a["source"] in SOURCES else len(SOURCES)
+            src_idx[i] = SOURCES.index(a["source"]) if (a["source"] in SOURCES and not anonymize) else len(SOURCES)
             lsrc_idx[i] = loc_src[a["source"]]
             clus_idx[i] = cluster_of[a["id"]]
             v = nv[a["id"]]
@@ -472,8 +493,9 @@ def main() -> None:
     device = pick_device()
     model = Reconciler().to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print("%s | device %s | params %.2fM | d_model %d layers %d heads %d | seed %d" % (
-        METHOD_NAME, device, n_params / 1e6, D_MODEL, N_LAYERS, N_HEADS, SEED))
+    print("%s | device %s | params %.2fM | d_model %d layers %d heads %d | seed %d%s" % (
+        METHOD_NAME, device, n_params / 1e6, D_MODEL, N_LAYERS, N_HEADS, SEED,
+        " | %d%% of training records without field / source identities" % round(100 * P_ANON) if ANON else ""))
     print("encoder input keys: %s" % ", ".join(OBSERVABLE_KEYS))
     if PERMUTE:
         print("*** PERMUTE = %r control run: training targets are shuffled; results should be at chance ***" % PERMUTE)
@@ -511,7 +533,11 @@ def main() -> None:
             tot, tot_e, tot_q, nb = 0.0, 0.0, 0.0, 0
             for s in range(steps_per_epoch):
                 cases = gen_cases(BATCH_CASES, seed=SEED * 10 ** 6 + epoch * 10 ** 4 + s)
-                enc = [e for e in (encode_case(c, enc_rng, permute=PERMUTE) for c in cases) if e is not None]
+                # ANON: one draw per record decides its encoding (with ANON = False no draw is made, so the stream
+                # of local ids is exactly v0.5's)
+                enc = [e for e in (encode_case(c, enc_rng, permute=PERMUTE,
+                                               anonymize=(ANON and enc_rng.random() < P_ANON))
+                                   for c in cases) if e is not None]
                 batch = collate(enc, device)
                 loss, le, lq = step_loss(model, batch)
                 opt.zero_grad(); loss.backward()

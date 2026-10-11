@@ -51,7 +51,8 @@ BOOTSTRAP = 300
 SEED = 7
 REFERENCE_METHOD = "reconciler"    # paired comparisons are against this method (skipped if it has no predictions)
 PAIRED_BOOTSTRAP = 2000
-PAIRWISE_METHODS = ["reconciler", "feat_hgb"]   # + every llm_* method: all pairs among them (prediction 23)
+PAIRWISE_METHODS = ["reconciler", "feat_hgb", "reconciler_anon"]   # + every llm_* method: all pairs among them
+                                                                     # (prediction 23; reconciler_anon: Parliament amendment)
 PAIRWISE_PREFIXES = ["llm_"]
 
 CONFLICT_TYPES = ["unit", "typo", "ocr_digit", "stale_recall", "stale_reimport", "duplicate", "correction",
@@ -408,6 +409,16 @@ def print_table(split: str, results: Dict[str, Dict[str, Any]], methods: List[st
           "about entries cannot beat it)" % fmt(any_r["entry_nll_best_constant"]))
 
 
+def print_validity(results: Dict[str, Dict[str, Any]], methods: List[str]) -> None:
+    print("\n-- per-assertion validity (precision / recall) --")
+    for m in methods:
+        r = results[m]
+        print("%-26s valid %5.2f/%5.2f  superseded %5.2f/%5.2f  erroneous %5.2f/%5.2f  AUC(sup) %s"
+              % (m[:26], r["asrt_valid_precision"], r["asrt_valid_recall"], r["asrt_superseded_precision"],
+                 r["asrt_superseded_recall"], r["asrt_erroneous_precision"], r["asrt_erroneous_recall"],
+                 fmt(r["asrt_auc_superseded"])))
+
+
 def print_paired(results: Dict[str, Dict[str, Any]], methods: List[str], rows_out: list, scope: str) -> None:
     if REFERENCE_METHOD not in results:
         return
@@ -571,13 +582,7 @@ def main() -> None:
             for m in methods:
                 line += "%14s" % fmt(results[m].get("acc:ftype:" + ft, float("nan")), True)
             print(line)
-        print("\n-- per-assertion validity (precision / recall) --")
-        for m in methods:
-            r = results[m]
-            print("%-26s valid %5.2f/%5.2f  superseded %5.2f/%5.2f  erroneous %5.2f/%5.2f  AUC(sup) %s"
-                  % (m[:26], r["asrt_valid_precision"], r["asrt_valid_recall"], r["asrt_superseded_precision"],
-                     r["asrt_superseded_recall"], r["asrt_erroneous_precision"], r["asrt_erroneous_recall"],
-                     fmt(r["asrt_auc_superseded"])))
+        print_validity(results, methods)
         print_paired(results, methods, all_rows, split)
         print_pairwise(results, methods, all_rows, split)
         print_seed_summary(results)
@@ -589,6 +594,7 @@ def main() -> None:
                 fres = score_block(split, cases, loaded, full, case_ids, scope, all_rows, cover)
                 print("\n=== %s split, all %d cases (methods covering every case) ===" % (split, len(cases)))
                 print_table(split, fres, full)
+                print_validity(fres, full)          # Parliament amendment: per-label numbers on the full split too
                 print_paired(fres, full, all_rows, scope)
                 print_pairwise(fres, full, all_rows, scope)
                 print_seed_summary(fres)

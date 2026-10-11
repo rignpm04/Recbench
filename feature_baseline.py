@@ -52,7 +52,10 @@ EVAL_FILES = {"train": "cases_train.jsonl", "val": "cases_val.jsonl", "heldout":
               "stock": "cases_stock.jsonl", "stock_nogold": "cases_stock_nogold.jsonl",
               "flight_dev": "cases_flight_dev.jsonl", "flight_test": "cases_flight_test.jsonl",
               "flight_dev_nogold": "cases_flight_dev_nogold.jsonl", "flight_test_nogold": "cases_flight_test_nogold.jsonl",
-              "book": "cases_book.jsonl", "book_subset": "cases_book_subset.jsonl"}       # missing files are skipped
+              "book": "cases_book.jsonl", "book_subset": "cases_book_subset.jsonl",
+              "parliament_dev": "cases_parliament_dev.jsonl", "parliament_dev_nobot": "cases_parliament_dev_nobot.jsonl",
+              "parliament_test": "cases_parliament_test.jsonl",
+              "parliament_test_nobot": "cases_parliament_test_nobot.jsonl"}       # missing files are skipped
 MAX_TRAIN_CASES = None         # TRAIN_SOURCE = "file" only: None = all 2000
 TABPFN_MAX_ROWS = 10000        # TabPFN v2 context limit; rows are subsampled to this
 CALIBRATION = None             # None (v0.4 default: calibrate.py temperature-scales every method the same way) | "isotonic" | "sigmoid"
