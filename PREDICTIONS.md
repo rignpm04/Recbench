@@ -440,3 +440,126 @@ scored clause by clause.
 - The LLM form with the highest entry macro-F1 beats the learned model with the highest entry macro-F1 by >= 0.10 (on
   the 200 cases): "semantics beat structure" on real records (v0.1 kill criterion). The paper proposes the cascade (a
   learned model for answers and calibration, an LLM pass on the entries it flags).
+
+---
+
+# Freeze (Oct 11, 2026, after phase 1, before any test split exists; committed as `v0.5: frozen`)
+
+No prediction above is edited. Phase 1 ran on Oct 10-11 on the development splits, the public sets and
+`parliament_dev`: generation, the public-set and Parliament mappings, tuning, every classical method, both learned
+models at seeds 1-3, both permutation controls, `reconciler_anon` (seed 1, leak test), DeepSeek `BATCH_RUNS_DEV`
+(1,450 calls, est. $2.71 at list prices, no reply cut off, 1 unparseable CoT sample of 1,000), a 3-case Claude check
+through the Batch API, `calibrate.py`, `score.py`. No test split exists: `gen.py` has not run with `MAKE_TEST_SPLITS`,
+and the sealed Parliament test files (fingerprints below) have been read by no method. No code or mapping bug was
+found.
+
+## What changes (no method changes)
+
+1. **`llm_baseline.py`: `WORKERS = 16`.** The DeepSeek path works on 16 cases at once; every case's prompt, settings
+   and number of calls are exactly as before, only the waiting overlaps. Checked against the phase-1 script on a local
+   fake API (Python 3.9 and 3.13; the test is not part of the repository): identical predictions case by case, the
+   same replies logged (plus two new fields, in a different line order), the same calls per case; retries, resuming,
+   a bad key, a bad model id or parameter, a case rejected with 400, a key or balance refused mid-run and the Stop
+   button tested. Three behaviours change: a preflight call (one tiny request with the pair's settings) now precedes
+   each synchronous pair, as one already preceded the batch submissions, and a wrong key, model id or setting stops
+   the run there; after it, a 400 / 404 / 422 on one case leaves that case unsaved for a re-run instead of stopping the
+   run (phase 1 stopped on a 400 / 404 that came before its first successful call), while 401 / 402 / 403 (key,
+   balance) stop it; the Stop button abandons the cases in flight (their calls finish unlogged and unsaved; a re-run
+   redoes them).
+2. **The model behind `deepseek-chat` goes on record.** DeepSeek's documentation no longer lists that id (v0.4, Oct
+   8-9, and phase 1, Oct 10-11, both used it), so which model answers is not documented. Every reply now records the
+   model name and fingerprint the API reports, `llm_costs.py` prints them and RESULTS reports them. Phase 2 re-runs
+   DeepSeek's zero-shot and CoT `val` forms (the phase-1 `val` files move to an archive folder first), so DeepSeek's
+   temperatures and its test predictions both come from phase 2, with the served model on record.
+3. **`reconciler_anon` at seeds 2 and 3** (`ANON = True`, `SEED = 2` / `3`; no code change), trained before phase 2
+   and run on the test splits as replicates. Reason: on `parliament_dev` the reconciler's three seeds score 88.0 /
+   92.7 / 92.0 (superseded recall 0.82 / 0.49 / 0.34), so one `reconciler_anon` seed cannot separate the effect of
+   hiding names from seed-to-seed spread. Items 29-35 keep referring to seed 1; score.py reports the replicates as
+   mean +- sd next to it.
+4. **Contingency.** If DeepSeek refuses `deepseek-chat` during phase 2, every DeepSeek run of phase 2 is repeated with
+   the id DeepSeek names as its replacement, `val` included, and the paper says so.
+
+## What phase 1 showed (development data, not results)
+
+`hard`, `heldout` and `snapshot` stand in for `test_hard`, `test_heldout` and `test_snapshot`. On the public sets the
+methods are already frozen, so phase 2 should reproduce the numbers below; phase 2's run is the record (the reconciler
+models run on a GPU whose arithmetic can differ slightly from run to run).
+
+- **15:** the leak test passed on all 15 splits present (development splits and public sets), for the reconciler and
+  `reconciler_anon`.
+- **16** (`hard`): cross control entry macro-F1 0.228, entry log-loss 0.982 vs 0.908 for the best constant, q_acc
+  62.8% vs 91.2% for `newest_observed`: inside all three bounds.
+- **17:** the temperature clause holds (`val` 1.03; an expectation, see the v0.5 honesty note). The other three miss
+  after scaling: wrong-overwrite@0.9 on `heldout` 4.2% (bound 3.0%; it is past the 4% kill threshold), unanswerable
+  queries answered at >= 0.9 on `heldout` 51% (bound 40%), wrong-overwrite on answerable queries 1.4% (`hard`) and
+  1.9% (`heldout`) (bound 1.0%).
+- **18:** weight accuracy on `hard` 87.5% (bound 85%). The CoT clause needs phase 2 (DeepSeek CoT ran on `val` only).
+- **19:** reconciler minus feature model, q_acc: `hard` +0.14 points (McNemar p 0.77), `heldout` +0.16 (p 0.44);
+  entry macro-F1 0.905 vs 0.930 on `hard` (0.025 apart; bound 0.02), 0.874 vs 0.876 on `heldout`.
+- **20:** sd of q_acc over seeds: `hard` 0.24 (reconciler) / 0.04 (feature model); `heldout` 0.08 / 0.00.
+- **21** (`hard`, DeepSeek zero-shot): valid recall 0.67 and entry macro-F1 0.648 (both predicted >= 0.80). With the
+  grading rules it over-calls "erroneous" (precision / recall 0.28 / 0.94; v0.4: 0.46 / 0.73).
+- **23** (`hard`): the reconciler is 1.6 points above DeepSeek zero-shot (McNemar p < 0.001); the other forms run in
+  phase 2.
+- **24** (`snapshot`): reconciler 83.9% vs 83.8% for the best classical method; `feed_error` queries 68.8% vs 69.6%
+  for majority vote (a lead of >= 2 points was predicted); erroneous recall 0.84.
+- **25** (public sets): `flight_test` gates 92.0% vs 92.3% for majority vote, overall 82.4% vs 82.8%; without the
+  airline sources every method scores lower, and the reconciler and majority vote tie at 80.1% (a tie is read as the
+  order not holding). The `flight_dev` clause (majority vote's gate accuracy vs v0.4) is computed from the v0.4
+  prediction files at results time.
+- **26** (public sets): on Stock every method except the three ordering rules moves less than 1 point from v0.4 (-0.4
+  to 0.0); `newest_observed`, `newest_arrival` and `source_priority` move +7.0 (74.5% -> 81.5%: their same-day
+  tie-break, the last-listed entry, now falls on a source picked by the seeded shuffle), and on Book +17.0 (43% ->
+  60%), where TruthFinder moves -3.0 (77% -> 74%; bound: less than 3). The reconciler is within 1 point of majority
+  vote on Stock (93.0% vs 93.1%) and 2 on Book (76% vs 75%). On `stock_nogold` six methods drop 1.05-1.38 points
+  (bound 1.0): the reconciler, the feature model, majority vote, time-decayed vote, TruthFinder and Dawid-Skene.
+- **Parliament** (`parliament_dev`, 50 cases, 150 queries):
+  - 29: both leak tests pass.
+  - 30: the reconciler is 4.0 points below `newest_observed` (88.0% vs 92.0%), but its superseded recall is 0.82: the
+    gap is there, the predicted mechanism is not. Its misses sit in majority (70% vs 94% for `newest_observed`; party
+    and seat 97% vs 91%), and it misses many valid entries (valid recall 0.71).
+  - 31: `reconciler_anon` 91.3% (0.7 below `newest_observed`, 3.3 above the reconciler), superseded recall 0.97, but
+    entry macro-F1 0.490 vs 0.526 (predicted: at least 0.10 above): it calls even more valid entries superseded (valid
+    recall 0.60). On `hard` and `heldout` it is within 0.3 points and 0.003 macro-F1 of the reconciler.
+  - 32: `feat_hgb` 88.7% (3.3 below `newest_observed`), superseded recall 0.60, entry macro-F1 0.340; `reconciler_anon`
+    minus `feat_hgb` +2.7 points and +0.150 macro-F1 (bounds 1.5 and 0.05). `feat_hgb`'s confidence never reaches 0.9
+    there (query ECE 0.45; valid recall 0.32).
+  - 33: `newest_observed` 92.0%; majority vote 94.0%, 2 points above it (predicted: at least 2 below); the classical
+    methods' erroneous recall 0.23-0.45 (predicted < 0.20); time-decayed vote 98.7%.
+  - 34: erroneous recall of the learned models 0.06 (`reconciler_anon`) and 0.21 (`feat_hgb`), predicted >= 0.25.
+    DeepSeek zero-shot: 93.3%, erroneous precision / recall 0.87 / 0.43, entry macro-F1 0.789, 0.30 above the best
+    learned model (the "semantics beat structure" consequence would apply).
+  - 35: every non-LLM method's `_nobot` q_acc is within 2.0 points of its full value (four of item 35's methods at
+    exactly 2.0).
+  - Seeds: the three reconciler seeds differ by at most 1.01 points on the synthetic splits (sd at most 0.53, on
+    `snapshot`), but on Parliament they score 88.0% / 92.7% / 92.0% (sd 2.5), with erroneous recall 0.11 / 0.32 /
+    0.60.
+
+**Reading, written down before the test** (to be checked, not assumed): the learned models' trouble on Parliament is
+most likely not the unfamiliar names. (a) Many Parliament histories reach well past a generated training record (at
+most 4 years; the reconciler's age features stop at 6 years, the feature model's are raw day counts), so old entries
+that are still true get read as out of date; (b) a majority jumps to a new value overnight at an election, while in
+the generated weight field sudden jumps are errors (real weight changes build up over time). No mapping bug was found,
+so the Parliament mapping, the sealed test files and every method stay as committed.
+
+## Exploratory analyses planned for phase 2 (reported as exploratory, not as predictions)
+
+- Parliament accuracy by field type (party and seat vs majority), as score.py prints it.
+- Parliament entry labels by the entry's age at the reference date (under 4 years vs 4 years or more), per method,
+  computed from the phase-2 prediction files by a read-only script.
+- Seed spread on Parliament: reconciler and `reconciler_anon`, seeds 1-3 each.
+
+## Sealed Parliament test files (built in phase 1; installed in phase 2 by copy, fingerprints checked)
+
+- `cases_parliament_test.jsonl` (400 cases, 3,253 entries): SHA-256
+  `6724d3ebd835b5db77378dacdd8b1d5cc325a5c8aaca39019363a219f1338e5e`
+- `cases_parliament_test_nobot.jsonl` (400 cases, 2,610 entries): SHA-256
+  `0b53abd456be50bea9ccf440f2ba74e5594093fa1b3982178f89158ba302af69`
+
+## Phase 2 order
+
+`parliament_map.py` with `INSTALL_TEST = True` -> `gen.py` with `MAKE_TEST_SPLITS = True` -> `baselines.py` ->
+`feature_baseline.py` `EVAL_ONLY` (seeds 1-3) -> `train_reconciler.py` `EVAL_ONLY`: seeds 1-3, both controls,
+`reconciler_anon` seeds 1-3 (seed 1 of the reconciler and of `reconciler_anon` with the leak test) -> DeepSeek's
+phase-1 `val` files to an archive folder -> `llm_baseline.py` `BATCH_RUNS_FINAL`, DeepSeek then Claude ->
+`calibrate.py` -> `score.py` -> `llm_costs.py`.

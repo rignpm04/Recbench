@@ -6,6 +6,7 @@
 # llm_baseline.py since v0.4: tokens from the API's usage field) and the matching preds files. Python 3.9, stdlib only.
 # Prints one row per (method, split): replies, cases, tokens in / out / cache-hit, estimated cost at the prices below,
 # finish reasons, and how many cases came back with no current values (the parser-coverage number for RESULTS.md).
+# v0.5 freeze: also lists the model name / fingerprint each API reported (llm_baseline.py records them since then).
 
 import glob
 import json
@@ -81,7 +82,14 @@ def main() -> None:
                 n_ans += len(p["queries"])
                 if not p["queries"]:
                     n_empty += 1
-        rows.append((method, split, len(replies), len(cases), tin, tout, tcache, cost, finish, n_pred, n_empty, n_q, n_ans))
+        served: Dict[str, List[Any]] = {}          # model name -> [replies, set of fingerprints]
+        for r in replies:
+            # written since the v0.5 freeze; replies from before it carry no model name
+            e = served.setdefault(str(r.get("served_model")) if "served_model" in r else "", [0, set()])
+            e[0] += 1
+            e[1].add(r.get("fingerprint"))
+        rows.append((method, split, len(replies), len(cases), tin, tout, tcache, cost, finish, n_pred, n_empty, n_q, n_ans,
+                     served))
 
     if not rows:
         print("no replies_llm_*.jsonl files found (they are written by llm_baseline.py v0.4+)")
@@ -89,12 +97,24 @@ def main() -> None:
     print("%-20s %-9s %7s %6s %11s %11s %9s %8s  %s" % ("method", "split", "replies", "cases", "tokens_in", "tokens_out", "cache_hit", "est_$", "finish reasons | cases w/o answers | queries answered"))
     tot_in = tot_out = 0
     tot_cost = 0.0
-    for m, s, nr, nc, tin, tout, tc, cost, finish, n_pred, n_empty, n_q, n_ans in rows:
+    for m, s, nr, nc, tin, tout, tc, cost, finish, n_pred, n_empty, n_q, n_ans, _ in rows:
         tot_in += tin; tot_out += tout; tot_cost += cost
         cov = ("%d/%d cases no answers | %d/%d queries (%.1f%%)" % (n_empty, n_pred, n_ans, n_q, 100.0 * n_ans / n_q)) if n_q else "-"
         print("%-20s %-9s %7d %6d %11d %11d %9d %8.3f  %s | %s" % (m, s, nr, nc, tin, tout, tc, cost, finish, cov))
     print("\ntotal: tokens in %d out %d | est. $%.2f at the PRICES per provider, batch replies at half price (cache hits are "
           "billed lower; the provider's console is the true cost)" % (tot_in, tot_out, tot_cost))
+    # v0.5 freeze: the model name / fingerprint each API reported (replies written before the freeze have none)
+    print("\nmodel reported by the API (replies, fingerprints):")
+    for m, sp, *_, served in rows:
+        parts = []
+        for name, (n, fps) in sorted(served.items()):
+            if not name:
+                parts.append("not recorded: %d replies (written before the v0.5 freeze)" % n)
+                continue
+            fp = sorted(str(f) for f in fps)
+            parts.append("%s: %d replies, fingerprint%s %s" % (name, n, "" if len(fp) == 1 else "s",
+                                                              ", ".join(fp) if len(fp) <= 3 else "x%d" % len(fp)))
+        print("  %-20s %-9s %s" % (m, sp, "; ".join(parts)))
 
 
 if __name__ == "__main__":

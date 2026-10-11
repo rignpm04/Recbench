@@ -24,6 +24,19 @@
 #     reply shows as finish_reason "length" in llm_costs.py.
 #   - SMOKE = True: 3 train cases per form into smoke_*.jsonl files (never scored) -- checks the key, the model id,
 #     the parser and, for Claude, the batch path, for under $1. Set it back to False afterwards.
+# v0.5 freeze (Oct 11, after phase 1, before any test split existed; PREDICTIONS.md, "Freeze"):
+#   - WORKERS: the synchronous path (DeepSeek) works on up to WORKERS cases at once. Every case's prompt, settings and
+#     number of calls are exactly as before; only the waiting overlaps (phase 1 ran one case at a time: ~3.2 h for
+#     1,450 calls). Predictions are appended as cases finish, so their line order differs from the cases file;
+#     score.py, calibrate.py and llm_costs.py read them by case id. WORKERS = 1 runs one case at a time, as in phase 1.
+#   - A preflight call (one tiny request with the pair's settings) now precedes every synchronous pair, as one already
+#     preceded the batch submissions: a wrong key, model id or setting stops the run there. During the run only
+#     401 / 402 / 403 (key, balance) stop it; a 400 / 404 / 422 on one case leaves that case unsaved for a re-run
+#     (phase 1 stopped on a 400 / 404 only before its first successful call). The Stop button abandons the cases in
+#     flight: their calls finish, unlogged and unsaved, and a re-run redoes them.
+#   - Every reply also records the model name and system fingerprint the API reports ("served_model", "fingerprint"
+#     in replies_*.jsonl; llm_costs.py prints them). DeepSeek's docs no longer list the id "deepseek-chat", so this
+#     is the record of which model answered. Logging only.
 #
 # MODE:
 #   "zero_shot"  one call per case, JSON output                          -> method llm_<tag>       (v0.1 baseline)
@@ -36,9 +49,11 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 from recbench_common import FIELDS, append_jsonl, cluster, load_jsonl, match, norm_value, serialize_assertion
@@ -96,7 +111,8 @@ BATCH_RUNS = BATCH_RUNS_DEV
 
 N_SHOTS = 2                                  # few_shot: worked examples taken from cases_train.jsonl
 N_SAMPLES = 5                                # cot_sc: samples per case
-SLEEP_S = 0.3                                # pause between synchronous calls
+WORKERS = 16                                 # synchronous path (DeepSeek): cases in flight at once (1 = one at a time)
+SLEEP_S = 0.3                                # pause after each case, per worker
 TIMEOUT_S = 300
 MAX_RETRIES = 5
 MAX_TOKENS = 16000                           # output cap per reply (v0.4: 8,000); billing counts only tokens produced
@@ -173,12 +189,17 @@ def _headers() -> Dict[str, str]:
     return {"Content-Type": "application/json", "Authorization": "Bearer " + API_KEY}
 
 
+STOP = threading.Event()      # set when a parallel run must end (bad key, Stop button): no new call is sent
+
+
 def _request(url: str, body: Optional[Dict[str, Any]] = None, method: str = "POST", raw: bool = False) -> Any:
-    """One HTTP call with retries. 400/401/403/404 are raised at once (retrying cannot help); 429 / 5xx / network
-    errors are retried, honouring a retry-after header."""
+    """One HTTP call with retries. 400/401/402/403/404/422 are raised at once (retrying cannot help); 429 / 5xx /
+    network errors are retried, honouring a retry-after header."""
     data = json.dumps(body).encode("utf-8") if body is not None else None
     last_err: Optional[Exception] = None
     for attempt in range(MAX_RETRIES):
+        if STOP.is_set():
+            raise RuntimeError("run stopped")
         req = urllib.request.Request(url, data=data, headers=_headers(), method=method)
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
@@ -188,18 +209,18 @@ def _request(url: str, body: Optional[Dict[str, Any]] = None, method: str = "POS
             last_err = e
             detail = e.read().decode("utf-8", "replace")[:300]
             print("  HTTP %s: %s" % (e.code, detail))
-            if e.code in (400, 401, 403, 404):          # a bad request / key / model id: retrying cannot help
+            if e.code in (400, 401, 402, 403, 404, 422):    # bad request / key / balance / model id / parameter
                 raise
             wait = 2.0 * (attempt + 1)
             try:
                 wait = max(wait, float(e.headers.get("retry-after") or 0))
             except (TypeError, ValueError):
                 pass
-            time.sleep(min(wait, 120.0))
+            STOP.wait(min(wait, 120.0))
         except Exception as e:  # timeouts, connection resets
             last_err = e
             print("  error: %s" % e)
-            time.sleep(2.0 * (attempt + 1))
+            STOP.wait(2.0 * (attempt + 1))
     raise RuntimeError("gave up: %s" % last_err)
 
 
@@ -224,7 +245,8 @@ def normalize_openai(resp: Dict[str, Any]) -> Dict[str, Any]:
     return {"text": (ch.get("message") or {}).get("content") or "", "finish_reason": ch.get("finish_reason"),
             "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
             "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
-            "cache_hit_tokens": int(usage.get("prompt_cache_hit_tokens", 0) or 0)}
+            "cache_hit_tokens": int(usage.get("prompt_cache_hit_tokens", 0) or 0),
+            "served_model": resp.get("model"), "fingerprint": resp.get("system_fingerprint")}
 
 
 def normalize_anthropic(msg: Dict[str, Any]) -> Dict[str, Any]:
@@ -237,7 +259,8 @@ def normalize_anthropic(msg: Dict[str, Any]) -> Dict[str, Any]:
     return {"text": text, "finish_reason": {"end_turn": "stop", "max_tokens": "length", "stop_sequence": "stop"}.get(stop, stop),
             "prompt_tokens": int(usage.get("input_tokens", 0) or 0) + cached
                              + int(usage.get("cache_creation_input_tokens", 0) or 0),
-            "completion_tokens": int(usage.get("output_tokens", 0) or 0), "cache_hit_tokens": cached}
+            "completion_tokens": int(usage.get("output_tokens", 0) or 0), "cache_hit_tokens": cached,
+            "served_model": msg.get("model"), "fingerprint": None}
 
 
 def mode_temperature() -> Optional[float]:
@@ -468,7 +491,8 @@ def todo_cases() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
 def record_reply(case: Dict[str, Any], rep: Dict[str, Any], extra: Optional[Dict[str, Any]] = None) -> None:
     row = {"case_id": case["case_id"], "mode": MODE, "text": rep["text"] or "", "finish_reason": rep["finish_reason"],
            "prompt_tokens": rep["prompt_tokens"], "completion_tokens": rep["completion_tokens"],
-           "cache_hit_tokens": rep["cache_hit_tokens"], "price_factor": rep.get("price_factor", 1.0)}
+           "cache_hit_tokens": rep["cache_hit_tokens"], "price_factor": rep.get("price_factor", 1.0),
+           "served_model": rep.get("served_model"), "fingerprint": rep.get("fingerprint")}
     if extra:
         row.update(extra)
     append_jsonl(REPLIES_FILE, row)
@@ -497,58 +521,149 @@ def finish_case(case: Dict[str, Any], reps: List[Dict[str, Any]]) -> int:
 
 
 # ============================================================ synchronous runs (DeepSeek; Claude with "batch": False)
+class StopRun(Exception):
+    """The key or the balance was refused in the middle of a run (401 / 402 / 403): stop. Carries the case's replies
+    received so far."""
+
+    def __init__(self, msg: str, reps: List[Dict[str, Any]]):
+        super().__init__(msg)
+        self.reps = reps
+
+
+def preflight_sync() -> None:
+    """One tiny call with this pair's model, key and settings before any case is sent, so a wrong key, model id or
+    parameter stops the run at once. After it, a 400 / 404 / 422 concerns one case's request (that case is not saved
+    and a re-run retries it); only 401 / 402 / 403 stop the run."""
+    if API == "anthropic":
+        preflight()
+        return
+    body: Dict[str, Any] = {"model": MODEL, "max_tokens": 16,
+                            "messages": [{"role": "system", "content": "Reply with this json: {\"ok\": true}"},
+                                         {"role": "user", "content": "ok?"}]}
+    if mode_temperature() is not None:
+        body["temperature"] = mode_temperature()
+    if JSON_MODE and MODE != "cot_sc":
+        body["response_format"] = {"type": "json_object"}
+    try:
+        _request(BASE_URL + "/chat/completions", body)
+    except urllib.error.HTTPError as e:
+        raise SystemExit("API error %s on the preflight call -- check the key, model id, settings and balance in "
+                         "PROVIDERS[%r]." % (e.code, PROVIDER))
+    except RuntimeError as e:
+        raise SystemExit("no answer to the preflight call (%s) -- check the connection and try again." % e)
+
+
+def run_case(case: Dict[str, Any], shots: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int, List[str]]:
+    """Every call of one case, in a worker thread: (replies, calls that got no reply, lines to print). Nothing is
+    written here; the main thread records the replies and saves the case."""
+    messages = build_messages(case, shots)
+    reps: List[Dict[str, Any]] = []
+    no_reply, notes = 0, []
+    for _ in range(n_calls()):
+        if STOP.is_set():
+            no_reply += 1
+            continue
+        try:
+            rep = chat(messages)
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 402, 403):               # the key or the balance stopped working: end the run
+                STOP.set()
+                raise StopRun("API error %s on case %s -- check the key (401 / 403) or the balance (402) for "
+                              "PROVIDERS[%r]. Finished cases are saved; re-run to continue."
+                              % (e.code, case["case_id"], PROVIDER), reps)
+            notes.append("case %s failed: %s" % (case["case_id"], e))
+            no_reply += 1
+            continue
+        except Exception as e:
+            notes.append("case %s failed: %s" % (case["case_id"], e))
+            no_reply += 1
+            continue
+        reps.append(rep)
+    if not STOP.is_set():
+        time.sleep(SLEEP_S)
+    return reps, no_reply, notes
+
+
 def run_one() -> Tuple[int, int, int]:
-    """Run the current MODE / SPLIT; returns (tokens in, tokens out, failures)."""
+    """Run the current MODE / SPLIT, WORKERS cases at a time; returns (tokens in, tokens out, failures)."""
     todo, shots, n_all = todo_cases()
-    print("%s / %s: %d cases, %d already done, %d to run -> %s" % (SPLIT, MODE, n_all, n_all - len(todo), len(todo), OUT_FILE))
+    print("%s / %s: %d cases, %d already done, %d to run -> %s | %d at a time"
+          % (SPLIT, MODE, n_all, n_all - len(todo), len(todo), OUT_FILE, max(1, int(WORKERS))))
     if shots:
         print("few-shot examples: %s" % ", ".join(s["case_id"] for s in shots))
-    tok_in = tok_out = 0
-    failures = 0
-    unsaved = 0
-    n_ok_calls = 0
-    t0 = time.time()
-    for i, case in enumerate(todo):
+    real = []
+    for case in todo:
         if not case["queries"] and not case["assertions"]:     # an empty record (snapshot feeds can leave one): no call
             append_jsonl(OUT_FILE, empty_record(case))
-            continue
-        messages = build_messages(case, shots)
-        reps = []
-        no_reply = 0
-        for _ in range(n_calls()):
-            try:
-                rep = chat(messages)
-                n_ok_calls += 1
-            except urllib.error.HTTPError as e:
-                # a bad key stops the run; a bad model id / request on the very first call stops it too
-                if e.code in (401, 403) or (e.code in (400, 404) and n_ok_calls == 0):
-                    raise SystemExit("API error %s on case %s -- check the key, model id and base_url in PROVIDERS[%r]. "
-                                     "Nothing was saved for this case; re-run to continue." % (e.code, case["case_id"], PROVIDER))
-                print("case %s failed: %s" % (case["case_id"], e))
-                failures += 1
-                no_reply += 1
-                continue
-            except Exception as e:
-                print("case %s failed: %s" % (case["case_id"], e))
-                failures += 1
-                no_reply += 1
-                continue
+        else:
+            real.append(case)
+    tok_in = tok_out = failures = unsaved = done = 0
+    stop_msg: Optional[str] = None
+    models_seen: set = set()
+    STOP.clear()
+    if real:
+        preflight_sync()
+    t0 = time.time()
+
+    def progress() -> None:
+        cost = tok_in / 1e6 * PRICE_IN_PER_M + tok_out / 1e6 * PRICE_OUT_PER_M
+        print("%d/%d done | %.0fs | tokens in %d out %d | est. cost $%.3f | failures %d"
+              % (done, len(real), time.time() - t0, tok_in, tok_out, cost, failures))
+
+    def log_replies(case: Dict[str, Any], reps: List[Dict[str, Any]]) -> None:
+        nonlocal tok_in, tok_out
+        for rep in reps:
             tok_in += rep["prompt_tokens"]
             tok_out += rep["completion_tokens"]
             record_reply(case, rep)
-            reps.append(rep)
-        if no_reply:
-            # a case with a call that got no reply (network / server error after the retries) is not saved, so a
-            # re-run retries it (v0.4 saved an empty record that counted as done)
-            unsaved += 1
-            print("case %s: %d of %d calls got no reply -- not saved; re-run to retry it" % (case["case_id"], no_reply, n_calls()))
-            continue
-        failures += finish_case(case, reps)
-        if (i + 1) % 10 == 0 or i == len(todo) - 1:
-            cost = tok_in / 1e6 * PRICE_IN_PER_M + tok_out / 1e6 * PRICE_OUT_PER_M
-            print("%d/%d done | %.0fs | tokens in %d out %d | est. cost $%.3f | failures %d"
-                  % (i + 1, len(todo), time.time() - t0, tok_in, tok_out, cost, failures))
-        time.sleep(SLEEP_S)
+            if rep.get("served_model") not in models_seen:
+                models_seen.add(rep.get("served_model"))
+                print("the API reports model %r for these replies" % rep.get("served_model"))
+
+    pool = ThreadPoolExecutor(max_workers=max(1, int(WORKERS)))
+    try:
+        futures = {pool.submit(run_case, c, shots): c for c in real}
+        for fut in as_completed(futures):
+            case = futures[fut]
+            try:
+                reps, no_reply, notes = fut.result()
+            except CancelledError:
+                unsaved += 1
+                continue
+            except StopRun as e:
+                log_replies(case, e.reps)
+                if stop_msg is None:
+                    stop_msg = str(e)
+                    for f in futures:
+                        f.cancel()
+                unsaved += 1
+                continue
+            for line in notes:
+                print(line)
+            failures += len(notes)
+            log_replies(case, reps)
+            if no_reply:
+                # a case with a call that got no reply (network / server error after the retries) is not saved, so a
+                # re-run retries it (v0.4 saved an empty record that counted as done)
+                unsaved += 1
+                if not STOP.is_set():
+                    print("case %s: %d of %d calls got no reply -- not saved; re-run to retry it"
+                          % (case["case_id"], no_reply, n_calls()))
+                continue
+            failures += finish_case(case, reps)
+            done += 1
+            if done % 10 == 0 or done == len(real):
+                progress()
+    except BaseException:
+        # the Stop button / Ctrl+C (or a bug): send no new call; calls already in flight end on their own, unsaved
+        STOP.set()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown(wait=True)
+    if real and done % 10 != 0 and done != len(real):
+        progress()
+    if stop_msg:
+        raise SystemExit(stop_msg)
     if unsaved:
         print("*** %d case(s) got no reply and were not saved: run llm_baseline.py again (it only runs the missing ones) ***"
               % unsaved)
@@ -571,6 +686,8 @@ def preflight() -> None:
     except urllib.error.HTTPError as e:
         raise SystemExit("API error %s on the preflight call -- check the key, model id and settings in PROVIDERS[%r]."
                          % (e.code, PROVIDER))
+    except RuntimeError as e:
+        raise SystemExit("no answer to the preflight call (%s) -- check the connection and try again." % e)
     print("preflight ok: %s accepts the request settings" % MODEL)
 
 
@@ -707,7 +824,8 @@ def main() -> None:
         print("*** SMOKE = True: %d train cases per form, files smoke_*.jsonl (not scored). Set SMOKE = False after. ***"
               % SMOKE_CASES)
     print("provider %s | model %s | method names llm_%s* | max_tokens %d | %s"
-          % (PROVIDER, MODEL, MODEL_TAG, MAX_TOKENS, "Batch API" if (API == "anthropic" and USE_BATCH) else "synchronous"))
+          % (PROVIDER, MODEL, MODEL_TAG, MAX_TOKENS, "Batch API" if (API == "anthropic" and USE_BATCH)
+             else "synchronous, %d cases at a time" % max(1, int(WORKERS))))
     t0 = time.time()
     if API == "anthropic" and USE_BATCH:
         tot_in, tot_out, tot_fail = run_batches(runs)
